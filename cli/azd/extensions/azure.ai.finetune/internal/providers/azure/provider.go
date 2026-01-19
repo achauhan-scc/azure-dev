@@ -6,6 +6,7 @@ package azure
 import (
 	"context"
 
+<<<<<<< HEAD
 	"azure.ai.finetune/internal/providers"
 	"azure.ai.finetune/pkg/models"
 )
@@ -30,6 +31,21 @@ func NewAzureProvider(endpoint, apiKey string) *AzureProvider {
 	return &AzureProvider{
 		endpoint: endpoint,
 		apiKey:   apiKey,
+=======
+	"azure.ai.finetune/pkg/models"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/cognitiveservices/armcognitiveservices"
+)
+
+// AzureProvider implements the provider interface for Azure APIs
+type AzureProvider struct {
+	clientFactory *armcognitiveservices.ClientFactory
+}
+
+// NewAzureProvider creates a new Azure provider instance
+func NewAzureProvider(clientFactory *armcognitiveservices.ClientFactory) *AzureProvider {
+	return &AzureProvider{
+		clientFactory: clientFactory,
+>>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 	}
 }
 
@@ -61,13 +77,21 @@ func (p *AzureProvider) GetFineTuningJobDetails(ctx context.Context, jobID strin
 }
 
 // GetJobEvents retrieves events for a fine-tuning job
+<<<<<<< HEAD
 func (p *AzureProvider) GetJobEvents(ctx context.Context, jobID string, limit int, after string) ([]*models.JobEvent, error) {
+=======
+func (p *AzureProvider) GetJobEvents(ctx context.Context, jobID string, limit int, after string) (*models.JobEventsList, error) {
+>>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 	// TODO: Implement
 	return nil, nil
 }
 
 // GetJobCheckpoints retrieves checkpoints for a fine-tuning job
+<<<<<<< HEAD
 func (p *AzureProvider) GetJobCheckpoints(ctx context.Context, jobID string, limit int, after string) ([]*models.JobCheckpoint, error) {
+=======
+func (p *AzureProvider) GetJobCheckpoints(ctx context.Context, jobID string, limit int, after string) (*models.JobCheckpointsList, error) {
+>>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 	// TODO: Implement
 	return nil, nil
 }
