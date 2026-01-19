@@ -5,11 +5,6 @@ package services
 
 import (
 	"context"
-<<<<<<< HEAD
-
-	"azure.ai.finetune/internal/providers"
-	"azure.ai.finetune/pkg/models"
-=======
 	"fmt"
 	"os"
 
@@ -19,7 +14,6 @@ import (
 	"azure.ai.finetune/pkg/models"
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
 	"github.com/fatih/color"
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 )
 
 // Ensure fineTuningServiceImpl implements FineTuningService interface
@@ -27,22 +21,12 @@ var _ FineTuningService = (*fineTuningServiceImpl)(nil)
 
 // fineTuningServiceImpl implements the FineTuningService interface
 type fineTuningServiceImpl struct {
-<<<<<<< HEAD
-=======
 	azdClient  *azdext.AzdClient
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 	provider   providers.FineTuningProvider
 	stateStore StateStore
 }
 
 // NewFineTuningService creates a new instance of FineTuningService
-<<<<<<< HEAD
-func NewFineTuningService(provider providers.FineTuningProvider, stateStore StateStore) FineTuningService {
-	return &fineTuningServiceImpl{
-		provider:   provider,
-		stateStore: stateStore,
-	}
-=======
 func NewFineTuningService(ctx context.Context, azdClient *azdext.AzdClient, stateStore StateStore) (FineTuningService, error) {
 	provider, err := factory.NewFineTuningProvider(ctx, azdClient)
 	if err != nil {
@@ -54,20 +38,10 @@ func NewFineTuningService(ctx context.Context, azdClient *azdext.AzdClient, stat
 		provider:   provider,
 		stateStore: stateStore,
 	}, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // CreateFineTuningJob creates a new fine-tuning job with business validation
 func (s *fineTuningServiceImpl) CreateFineTuningJob(ctx context.Context, req *models.CreateFineTuningRequest) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	// 1. Validate request (model exists, data size valid, etc.)
-	// 2. Call provider.CreateFineTuningJob()
-	// 3. Transform any errors to standardized ErrorDetail
-	// 4. Persist job to state store
-	// 5. Return job
-	return nil, nil
-=======
 	// Validate request
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
@@ -124,7 +98,6 @@ func (s *fineTuningServiceImpl) CreateFineTuningJob(ctx context.Context, req *mo
 	}
 
 	return job, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // GetFineTuningStatus retrieves the current status of a job
@@ -135,10 +108,6 @@ func (s *fineTuningServiceImpl) GetFineTuningStatus(ctx context.Context, jobID s
 
 // ListFineTuningJobs lists all fine-tuning jobs for the user
 func (s *fineTuningServiceImpl) ListFineTuningJobs(ctx context.Context, limit int, after string) ([]*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	var jobs []*models.FineTuningJob
 
 	// Use retry utility for list operation
@@ -153,27 +122,10 @@ func (s *fineTuningServiceImpl) ListFineTuningJobs(ctx context.Context, limit in
 	}
 
 	return jobs, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // GetFineTuningJobDetails retrieves detailed information about a job
 func (s *fineTuningServiceImpl) GetFineTuningJobDetails(ctx context.Context, jobID string) (*models.FineTuningJobDetail, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-}
-
-// GetJobEvents retrieves events for a job with filtering and pagination
-func (s *fineTuningServiceImpl) GetJobEvents(ctx context.Context, jobID string, limit int, after string) ([]*models.JobEvent, error) {
-	// TODO: Implement
-	return nil, nil
-}
-
-// GetJobCheckpoints retrieves checkpoints for a job with pagination
-func (s *fineTuningServiceImpl) GetJobCheckpoints(ctx context.Context, jobID string, limit int, after string) ([]*models.JobCheckpoint, error) {
-	// TODO: Implement
-	return nil, nil
-=======
 	var jobDetail *models.FineTuningJobDetail
 
 	// Use retry utility for job detail operation
@@ -247,47 +199,20 @@ func (s *fineTuningServiceImpl) executeJobAction(ctx context.Context, jobID stri
 		return nil, fmt.Errorf("failed to %s fine-tuning job: %w", action, err)
 	}
 	return job, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // PauseJob pauses a running job (if applicable)
 func (s *fineTuningServiceImpl) PauseJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	return s.executeJobAction(ctx, jobID, models.JobActionPause)
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // ResumeJob resumes a paused job (if applicable)
 func (s *fineTuningServiceImpl) ResumeJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	return s.executeJobAction(ctx, jobID, models.JobActionResume)
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // CancelJob cancels a job with proper state validation
 func (s *fineTuningServiceImpl) CancelJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-}
-
-// UploadTrainingFile uploads and validates a training file
-func (s *fineTuningServiceImpl) UploadTrainingFile(ctx context.Context, filePath string) (string, error) {
-	// TODO: Implement
-	return "", nil
-}
-
-// UploadValidationFile uploads and validates a validation file
-func (s *fineTuningServiceImpl) UploadValidationFile(ctx context.Context, filePath string) (string, error) {
-	// TODO: Implement
-	return "", nil
-=======
 	return s.executeJobAction(ctx, jobID, models.JobActionCancel)
 }
 
@@ -324,7 +249,6 @@ func (s *fineTuningServiceImpl) uploadFile(ctx context.Context, filePath string)
 		return err
 	})
 	return uploadedFileId, err
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // PollJobUntilCompletion polls a job until it completes or fails

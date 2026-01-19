@@ -1,9 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-<<<<<<< HEAD
-
-=======
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 package main
 
 import (

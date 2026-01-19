@@ -5,17 +5,6 @@ package openai
 
 import (
 	"context"
-<<<<<<< HEAD
-
-	"azure.ai.finetune/internal/providers"
-	"azure.ai.finetune/pkg/models"
-)
-
-// Ensure OpenAIProvider implements FineTuningProvider and ModelDeploymentProvider interfaces
-var (
-	_ providers.FineTuningProvider      = (*OpenAIProvider)(nil)
-	_ providers.ModelDeploymentProvider = (*OpenAIProvider)(nil)
-=======
 	"fmt"
 	"os"
 	"time"
@@ -24,24 +13,10 @@ var (
 	"github.com/azure/azure-dev/cli/azd/pkg/ux"
 	"github.com/fatih/color"
 	"github.com/openai/openai-go/v3"
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 )
 
 // OpenAIProvider implements the provider interface for OpenAI APIs
 type OpenAIProvider struct {
-<<<<<<< HEAD
-	// TODO: Add OpenAI SDK client
-	// client *openai.Client
-	apiKey   string
-	endpoint string
-}
-
-// NewOpenAIProvider creates a new OpenAI provider instance
-func NewOpenAIProvider(apiKey, endpoint string) *OpenAIProvider {
-	return &OpenAIProvider{
-		apiKey:   apiKey,
-		endpoint: endpoint,
-=======
 	client *openai.Client
 }
 
@@ -49,19 +24,11 @@ func NewOpenAIProvider(apiKey, endpoint string) *OpenAIProvider {
 func NewOpenAIProvider(client *openai.Client) *OpenAIProvider {
 	return &OpenAIProvider{
 		client: client,
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 	}
 }
 
 // CreateFineTuningJob creates a new fine-tuning job via OpenAI API
 func (p *OpenAIProvider) CreateFineTuningJob(ctx context.Context, req *models.CreateFineTuningRequest) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	// 1. Convert domain model to OpenAI SDK format
-	// 2. Call OpenAI SDK CreateFineTuningJob
-	// 3. Convert OpenAI response to domain model
-	return nil, nil
-=======
 
 	params, err := convertInternalJobParamToOpenAiJobParams(req)
 	if err != nil {
@@ -74,7 +41,6 @@ func (p *OpenAIProvider) CreateFineTuningJob(ctx context.Context, req *models.Cr
 	}
 
 	return convertOpenAIJobToModel(*job), nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // GetFineTuningStatus retrieves the status of a fine-tuning job
@@ -85,10 +51,6 @@ func (p *OpenAIProvider) GetFineTuningStatus(ctx context.Context, jobID string) 
 
 // ListFineTuningJobs lists all fine-tuning jobs
 func (p *OpenAIProvider) ListFineTuningJobs(ctx context.Context, limit int, after string) ([]*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	jobList, err := p.client.FineTuning.Jobs.List(ctx, openai.FineTuningJobListParams{
 		Limit: openai.Int(int64(limit)), // optional pagination control
 		After: openai.String(after),
@@ -106,27 +68,10 @@ func (p *OpenAIProvider) ListFineTuningJobs(ctx context.Context, limit int, afte
 	}
 
 	return jobs, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // GetFineTuningJobDetails retrieves detailed information about a job
 func (p *OpenAIProvider) GetFineTuningJobDetails(ctx context.Context, jobID string) (*models.FineTuningJobDetail, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-}
-
-// GetJobEvents retrieves events for a fine-tuning job
-func (p *OpenAIProvider) GetJobEvents(ctx context.Context, jobID string, limit int, after string) ([]*models.JobEvent, error) {
-	// TODO: Implement
-	return nil, nil
-}
-
-// GetJobCheckpoints retrieves checkpoints for a fine-tuning job
-func (p *OpenAIProvider) GetJobCheckpoints(ctx context.Context, jobID string, limit int, after string) ([]*models.JobCheckpoint, error) {
-	// TODO: Implement
-	return nil, nil
-=======
 	job, err := p.client.FineTuning.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -165,15 +110,10 @@ func (p *OpenAIProvider) GetJobCheckpoints(ctx context.Context, jobID string) (*
 	checkpoints := convertOpenAIJobCheckpointsToModel(checkpointsPage)
 
 	return checkpoints, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // PauseJob pauses a fine-tuning job
 func (p *OpenAIProvider) PauseJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	job, err := p.client.FineTuning.Jobs.Pause(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -182,15 +122,10 @@ func (p *OpenAIProvider) PauseJob(ctx context.Context, jobID string) (*models.Fi
 	finetuningJob := convertOpenAIJobToModel(*job)
 
 	return finetuningJob, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // ResumeJob resumes a paused fine-tuning job
 func (p *OpenAIProvider) ResumeJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	job, err := p.client.FineTuning.Jobs.Resume(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -199,15 +134,10 @@ func (p *OpenAIProvider) ResumeJob(ctx context.Context, jobID string) (*models.F
 	finetuningJob := convertOpenAIJobToModel(*job)
 
 	return finetuningJob, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // CancelJob cancels a fine-tuning job
 func (p *OpenAIProvider) CancelJob(ctx context.Context, jobID string) (*models.FineTuningJob, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return nil, nil
-=======
 	job, err := p.client.FineTuning.Jobs.Cancel(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -216,15 +146,10 @@ func (p *OpenAIProvider) CancelJob(ctx context.Context, jobID string) (*models.F
 	finetuningJob := convertOpenAIJobToModel(*job)
 
 	return finetuningJob, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // UploadFile uploads a file for fine-tuning
 func (p *OpenAIProvider) UploadFile(ctx context.Context, filePath string) (string, error) {
-<<<<<<< HEAD
-	// TODO: Implement
-	return "", nil
-=======
 	if filePath == "" {
 		return "", fmt.Errorf("file path cannot be empty")
 	}
@@ -279,7 +204,6 @@ func (p *OpenAIProvider) UploadFile(ctx context.Context, filePath string) (strin
 	}
 
 	return uploadedFile.ID, nil
->>>>>>> 428498d0f124a73e2e722a86cd49d2bf99d05ba7
 }
 
 // GetUploadedFile retrieves information about an uploaded file
