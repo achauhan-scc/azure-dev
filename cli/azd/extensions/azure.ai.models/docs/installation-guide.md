@@ -38,7 +38,7 @@ Sign in with your Azure credentials. This is required for both installing the ex
 Add the extension registry that contains the Azure AI Models extension:
 
 ```bash
-azd ext source add -n model -l "https://raw.githubusercontent.com/achauhan-scc/azure-dev/ba96e634e88395aae066a0bc026284665fced4c4/cli/azd/extensions/registry.json" -t url
+azd ext source add -n model -l "https://raw.githubusercontent.com/achauhan-scc/azure-dev/3b1bc1abe1eb106ad12811955c5e8fd2d8e92f9c/cli/azd/extensions/registry.json" -t url
 ```
 
 ![Extension Source Addition](images/01-ext-Source-Addition.jpg)
