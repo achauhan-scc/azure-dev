@@ -102,6 +102,9 @@ func TestMonitorCommand_DefaultValues(t *testing.T) {
 
 	session, _ := cmd.Flags().GetString("session-id")
 	assert.Equal(t, "", session)
+
+	userIdentity, _ := cmd.Flags().GetString("user-identity")
+	assert.Equal(t, "", userIdentity)
 }
 
 func TestMonitorCommand_SessionFlagRegistered(t *testing.T) {

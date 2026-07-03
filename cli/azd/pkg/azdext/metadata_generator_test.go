@@ -344,15 +344,29 @@ func TestGenerateExtensionMetadata_FlagOptionsOverride(t *testing.T) {
 		Use:   "list",
 		Short: "List things",
 		RunE:  func(cmd *cobra.Command, args []string) error { return nil },
-	}, FlagOptions{Name: "output", AllowedValues: []string{"json", "table"}, Default: "json"})
+	}, FlagOptions{
+		Name:          "output",
+		AllowedValues: []string{"json", "table"},
+		Default:       "json",
+		Usage:         "Output format for list results",
+	})
 
 	plainCmd := &cobra.Command{
 		Use:   "plain",
 		Short: "Plain command without override",
 		RunE:  func(cmd *cobra.Command, args []string) error { return nil },
 	}
+	pathCmd := RegisterFlagOptions(&cobra.Command{
+		Use:   "pack",
+		Short: "Pack things",
+		RunE:  func(cmd *cobra.Command, args []string) error { return nil },
+	}, FlagOptions{
+		Name:        "output",
+		Usage:       "Path to the output directory.",
+		HideDefault: true,
+	})
 
-	rootCmd.AddCommand(listCmd, plainCmd)
+	rootCmd.AddCommand(listCmd, plainCmd, pathCmd)
 
 	metadata := GenerateExtensionMetadata("1.0", "test.extension", rootCmd)
 
@@ -360,17 +374,36 @@ func TestGenerateExtensionMetadata_FlagOptionsOverride(t *testing.T) {
 	require.NotNil(t, listMeta)
 	listOutput := findFlag(listMeta.Flags, "output")
 	require.NotNil(t, listOutput)
-	// The metadata description stays clean; ValidValues carries the allowed
-	// set so JSON consumers can render or validate it as they prefer.
-	assert.Equal(t, defaultOutputFlagUsage, listOutput.Description)
+	assert.Equal(t, "Output format for list results", listOutput.Description)
 	assert.Equal(t, []string{"json", "table"}, listOutput.ValidValues)
 	assert.Equal(t, "json", listOutput.Default)
 
 	plainMeta := findCommand(metadata.Commands, "plain")
 	require.NotNil(t, plainMeta)
 	plainOutput := findFlag(plainMeta.Flags, "output")
-	require.NotNil(t, plainOutput)
-	assert.Equal(t, defaultOutputFlagUsage, plainOutput.Description)
-	assert.Empty(t, plainOutput.ValidValues)
-	assert.Equal(t, "default", plainOutput.Default)
+	require.Nil(t, plainOutput)
+
+	pathMeta := findCommand(metadata.Commands, "pack")
+	require.NotNil(t, pathMeta)
+	pathOutput := findFlag(pathMeta.Flags, "output")
+	require.NotNil(t, pathOutput)
+	assert.Equal(t, "Path to the output directory.", pathOutput.Description)
+	assert.Empty(t, pathOutput.Default)
+}
+
+func TestGenerateExtensionMetadata_VersionCommandOutputFormat(t *testing.T) {
+	rootCmd, _ := NewExtensionRootCommand(ExtensionCommandOptions{Name: "test-ext"})
+	outputFormat := ""
+
+	rootCmd.AddCommand(NewVersionCommand("test-ext", "1.0.0", &outputFormat))
+
+	metadata := GenerateExtensionMetadata("1.0", "test.extension", rootCmd)
+
+	versionMeta := findCommand(metadata.Commands, "version")
+	require.NotNil(t, versionMeta)
+
+	outputFlag := findFlag(versionMeta.Flags, "output")
+	require.NotNil(t, outputFlag)
+	assert.Equal(t, defaultOutputFlagUsage, outputFlag.Description)
+	assert.Equal(t, []string{"json"}, outputFlag.ValidValues)
 }

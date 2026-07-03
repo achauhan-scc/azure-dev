@@ -19,12 +19,15 @@ type ToolCategory string
 const (
 	// ToolCategoryCLI is a standalone command-line binary (e.g. az, copilot).
 	ToolCategoryCLI ToolCategory = "cli"
-	// ToolCategoryExtension is an IDE extension (e.g. VS Code extensions).
-	ToolCategoryExtension ToolCategory = "extension"
+	// ToolCategoryVSCodeExtension is a VS Code extension.
+	ToolCategoryVSCodeExtension ToolCategory = "vscode-extension"
 	// ToolCategoryServer is a long-running background process or server (e.g. MCP server).
 	ToolCategoryServer ToolCategory = "server"
-	// ToolCategoryLibrary is an azd extension or plugin library.
-	ToolCategoryLibrary ToolCategory = "library"
+	// ToolCategoryAzdExtension is an azd extension installed via `azd extension install`.
+	ToolCategoryAzdExtension ToolCategory = "azd-extension"
+	// ToolCategorySkill is a skill hosted by an agent CLI that azd installs through the
+	// host's native plugin commands.
+	ToolCategorySkill ToolCategory = "skill"
 )
 
 // ToolPriority indicates how strongly a tool is recommended.
@@ -45,6 +48,65 @@ type Checksum struct {
 	Value string
 }
 
+// SkillHost describes how a single agent CLI host (e.g. GitHub Copilot CLI,
+// Claude Code) installs and updates a skill. Skill tools carry one or more
+// SkillHost entries; by default the installer targets the preferred host
+// (the first on PATH), but install/upgrade can target specific or all
+// detected hosts when the caller selects them (e.g. via `--host`).
+type SkillHost struct {
+	// Host is the binary name of the agent CLI (e.g. "copilot", "claude").
+	Host string
+	// MarketplaceAddCommand is the optional one-time command that registers
+	// the plugin marketplace with the host (e.g. ["plugin", "marketplace",
+	// "add", "microsoft/azure-skills"]). Empty when not required.
+	MarketplaceAddCommand []string
+	// PluginInstallCommand installs the plugin via the host
+	// (e.g. ["plugin", "install", "azure@azure-skills"]).
+	PluginInstallCommand []string
+	// PluginUpdateCommand updates the plugin to its latest version.
+	PluginUpdateCommand []string
+	// PluginUninstallCommand removes the plugin from the host
+	// (e.g. ["plugin", "uninstall", "azure@azure-skills"]).
+	PluginUninstallCommand []string
+	// PluginListCommand lists installed plugins on the host
+	// (e.g. ["plugin", "list"]). The detector runs this command and
+	// searches the output for PluginName to decide whether the skill
+	// is installed.
+	PluginListCommand []string
+	// PluginName is the plugin's short name as reported by the host's
+	// plugin listing (e.g. "azure"). Used by the detector.
+	PluginName string
+	// VersionRegex is a Go regular expression with a capture group for
+	// the semver portion of the version output of PluginListCommand.
+	// Required: the detector treats a VersionRegex match as the
+	// authoritative signal that the skill is installed (and uses the
+	// captured group as InstalledVersion). A host with an empty
+	// VersionRegex is never reported as installed.
+	VersionRegex string
+	// BinaryVersionArgs are the CLI arguments that make the host binary
+	// print its own version (e.g. ["--version"]). Together with
+	// BinaryVersionRegex these let the installer confirm the host is a
+	// genuine, functional CLI before installing through it — not merely a
+	// file of the same name on PATH. Some environments place a launcher
+	// stub on PATH (e.g. the VS Code GitHub Copilot Chat extension drops a
+	// small `copilot` stub into its globalStorage and adds that folder to
+	// the integrated terminal's PATH) that exits 0 but only prompts to
+	// install the real CLI; such a stub passes a bare PATH existence check
+	// yet cannot install the skill. When empty, the installer falls back to
+	// an existence-only check.
+	BinaryVersionArgs []string
+	// BinaryVersionRegex is a Go regular expression whose first capture
+	// group matches the host binary's own version. To avoid mistaking a
+	// launcher stub for a real CLI, anchor it to the host's `--version`
+	// banner with `(?m)^` (e.g. `(?m)^GitHub Copilot CLI\s+v?(\d+\.\d+\.\d+)`)
+	// rather than matching a bare semver: a stub's output may contain an
+	// incidental version-shaped token (a bundled runtime version, a path
+	// build number, a URL) that must not count. The installer treats a match
+	// against the probe output as proof the host CLI is genuinely installed.
+	// When empty, the functional probe is skipped.
+	BinaryVersionRegex string
+}
+
 // InstallStrategy describes how to install a tool on a specific platform.
 type InstallStrategy struct {
 	// PackageManager is the package manager name (e.g. "winget", "brew", "apt", "npm", "code").
@@ -54,6 +116,12 @@ type InstallStrategy struct {
 	// InstallCommand is the full shell command when a simple package-manager install
 	// does not apply (e.g. "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash").
 	InstallCommand string
+	// UninstallCommand is the full command that reverses InstallCommand
+	// when no package-manager uninstall applies (e.g.
+	// "azd extension uninstall azure.ai.agents"). When empty and no
+	// package manager is configured, azd reports that it cannot uninstall
+	// the tool automatically.
+	UninstallCommand string
 	// DirectDownloadUrl is a URL to a binary or archive that azd downloads
 	// directly. When set, azd downloads the artifact, verifies its checksum
 	// (if provided), and makes it available locally. This path is used
@@ -74,7 +142,7 @@ type ToolDefinition struct {
 	Name string
 	// Description summarizes what the tool does in one sentence.
 	Description string
-	// Category classifies the tool (CLI, extension, server, or library).
+	// Category classifies the tool (CLI, VS Code extension, server, or azd extension).
 	Category ToolCategory
 	// Priority indicates whether the tool is recommended or optional.
 	Priority ToolPriority
@@ -90,6 +158,13 @@ type ToolDefinition struct {
 	// InstallStrategies maps a GOOS value ("windows", "darwin", "linux") to the
 	// platform-specific installation strategy.
 	InstallStrategies map[string]InstallStrategy
+	// SkillHosts describes the agent CLI hosts that can install this tool when
+	// Category == ToolCategorySkill. Hosts are listed in preference order: by
+	// default the first host on PATH is used, but install/upgrade can target
+	// specific or all detected hosts (e.g. `--host all`). Platform-agnostic
+	// because the host CLI's plugin command syntax does not vary between
+	// operating systems. Ignored for other categories.
+	SkillHosts []SkillHost
 	// Dependencies lists the IDs of tools that must be installed before this one.
 	Dependencies []string
 }
@@ -132,6 +207,7 @@ var builtInTools = []*ToolDefinition{
 	vscodeGitHubCopilot(),
 	azureMCPServer(),
 	azdAIExtensions(),
+	azureSkills(),
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +280,7 @@ func vscodeAzureTools() *ToolDefinition {
 		Name: "Azure Tools VS Code Extension",
 		Description: "VS Code extension for browsing and managing " +
 			"Azure resources.",
-		Category:      ToolCategoryExtension,
+		Category:      ToolCategoryVSCodeExtension,
 		Priority:      ToolPriorityRecommended,
 		Website:       "https://marketplace.visualstudio.com/items?itemName=ms-azuretools.vscode-azureresourcegroups",
 		DetectCommand: "code",
@@ -222,7 +298,7 @@ func vscodeBicep() *ToolDefinition {
 		Id:            "vscode-bicep",
 		Name:          "Bicep VS Code Extension",
 		Description:   "VS Code extension providing language support for Azure Bicep.",
-		Category:      ToolCategoryExtension,
+		Category:      ToolCategoryVSCodeExtension,
 		Priority:      ToolPriorityRecommended,
 		Website:       "https://marketplace.visualstudio.com/items?itemName=ms-azuretools.vscode-bicep",
 		DetectCommand: "code",
@@ -240,7 +316,7 @@ func vscodeGitHubCopilot() *ToolDefinition {
 		Id:            "GitHub.copilot-chat",
 		Name:          "GitHub Copilot Chat VS Code Extension",
 		Description:   "VS Code extension for AI-powered code completions, chat, and agent mode.",
-		Category:      ToolCategoryExtension,
+		Category:      ToolCategoryVSCodeExtension,
 		Priority:      ToolPriorityOptional,
 		Website:       "https://marketplace.visualstudio.com/items?itemName=GitHub.copilot-chat",
 		DetectCommand: "code",
@@ -261,7 +337,7 @@ func azureMCPServer() *ToolDefinition {
 		Description:   "Model Context Protocol server for Azure resource interaction.",
 		Category:      ToolCategoryServer,
 		Priority:      ToolPriorityOptional,
-		Website:       "https://github.com/Azure/azure-mcp",
+		Website:       "https://github.com/microsoft/mcp",
 		DetectCommand: "npm",
 		VersionArgs:   []string{"list", "-g", "@azure/mcp", "--json"},
 		VersionRegex:  `"@azure/mcp":\s*\{\s*"version":\s*"(\d+\.\d+\.\d+(?:-[^"]*)?)"`,
@@ -275,18 +351,79 @@ func azureMCPServer() *ToolDefinition {
 
 func azdAIExtensions() *ToolDefinition {
 	return &ToolDefinition{
-		Id:            "azd-ai-extensions",
-		Name:          "azd AI Extensions",
+		Id:            "azure.ai.agents",
+		Name:          "azd AI Agent Extensions",
 		Description:   "Azure Developer CLI extensions for AI agent workflows.",
-		Category:      ToolCategoryLibrary,
+		Category:      ToolCategoryAzdExtension,
 		Priority:      ToolPriorityOptional,
 		Website:       "https://learn.microsoft.com/azure/developer/azure-developer-cli/",
 		DetectCommand: "azd",
 		VersionArgs:   []string{"extension", "list", "--installed", "--output", "json"},
 		InstallStrategies: allPlatforms(InstallStrategy{
-			InstallCommand: "azd extension install azure.ai.agents",
+			InstallCommand:   "azd extension install azure.ai.agents --source azd",
+			UninstallCommand: "azd extension uninstall azure.ai.agents",
 		}),
-		Dependencies: []string{"az-cli"},
+	}
+}
+
+func azureSkills() *ToolDefinition {
+	return &ToolDefinition{
+		Id:   "azure-skills",
+		Name: "Azure Skills",
+		Description: "Azure skills for AI coding assistants. " +
+			"Provides skills and MCP server configurations for Azure scenarios.",
+		Category: ToolCategorySkill,
+		Priority: ToolPriorityRecommended,
+		Website:  "https://github.com/microsoft/azure-skills",
+		SkillHosts: []SkillHost{
+			{
+				Host:                   "copilot",
+				MarketplaceAddCommand:  []string{"plugin", "marketplace", "add", "microsoft/azure-skills"},
+				PluginInstallCommand:   []string{"plugin", "install", "azure@azure-skills"},
+				PluginUpdateCommand:    []string{"plugin", "update", "azure@azure-skills"},
+				PluginUninstallCommand: []string{"plugin", "uninstall", "azure@azure-skills"},
+				PluginListCommand:      []string{"plugin", "list"},
+				PluginName:             "azure@azure-skills",
+				// Sample: "  • azure@azure-skills (v1.1.70)"
+				VersionRegex: `azure@azure-skills[^\n]*?(\d+\.\d+\.\d+)`,
+				// Probe the host binary itself so a launcher stub that only
+				// prompts to install the real CLI is not mistaken for a host.
+				// Anchored to copilot's `--version` banner ("GitHub Copilot
+				// CLI 1.0.64-3") so an incidental semver cannot pass.
+				BinaryVersionArgs:  []string{"--version"},
+				BinaryVersionRegex: `(?m)^GitHub Copilot CLI\s+v?(\d+\.\d+\.\d+)`,
+			},
+			{
+				Host: "claude",
+				MarketplaceAddCommand: []string{
+					"plugin", "marketplace", "add", "https://github.com/microsoft/azure-skills",
+				},
+				PluginInstallCommand:   []string{"plugin", "install", "azure@azure-skills"},
+				PluginUpdateCommand:    []string{"plugin", "update", "azure@azure-skills"},
+				PluginUninstallCommand: []string{"plugin", "uninstall", "azure@azure-skills"},
+				PluginListCommand:      []string{"plugin", "list", "--json"},
+				PluginName:             "azure@azure-skills",
+				// `claude plugin list` ignores a plugin-name argument, so
+				// list every plugin as JSON and anchor on the
+				// azure@azure-skills entry. Sample (--json):
+				//   [
+				//     {
+				//       "id": "azure@azure-skills",
+				//       "version": "1.1.73",
+				//       ...
+				//     }
+				//   ]
+				// "version" follows "id" within the same object, so [^}]
+				// keeps the capture scoped to the azure@azure-skills entry.
+				VersionRegex: `"id":\s*"azure@azure-skills"[^}]*?"version":\s*"v?(\d+\.\d+\.\d+)"`,
+				// Probe the host binary itself so a launcher stub that only
+				// prompts to install the real CLI is not mistaken for a host.
+				// Anchored to claude's `--version` banner ("2.1.178 (Claude
+				// Code)") so an incidental semver cannot pass.
+				BinaryVersionArgs:  []string{"--version"},
+				BinaryVersionRegex: `(?m)^v?(\d+\.\d+\.\d+)\s+\(Claude Code\)`,
+			},
+		},
 	}
 }
 

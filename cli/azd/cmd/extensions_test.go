@@ -7,10 +7,13 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/azure/azure-dev/cli/azd/cmd/actions"
-	"github.com/azure/azure-dev/cli/azd/pkg/extensions"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/azure/azure-dev/cli/azd/cmd/actions"
+	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/pkg/extensions"
 )
 
 // findChildByName returns the child action descriptor with the given name, or nil if not found.
@@ -179,4 +182,71 @@ func TestBindExtension_DeeplyNestedNamespace(t *testing.T) {
 	require.NotNil(t, evalCmd)
 	require.Equal(t, "Extension for fine tuning AI models.", finetuneCmd.Options.Command.Short)
 	require.Equal(t, "Extension for evaluating AI models.", evalCmd.Options.Command.Short)
+}
+
+func TestStripCwdFlag(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "NoFlag",
+			args: []string{"init", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "LongFormSeparateValue",
+			args: []string{"init", "--cwd", "myFolder", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "LongFormEqualsValue",
+			args: []string{"init", "--cwd=myFolder", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "ShortFormSeparateValue",
+			args: []string{"init", "-C", "myFolder", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "ShortFormEqualsValue",
+			args: []string{"init", "-C=myFolder", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "ShortFormCombinedValue",
+			args: []string{"init", "-CmyFolder", "--no-prompt"},
+			want: []string{"init", "--no-prompt"},
+		},
+		{
+			name: "EmptyArgs",
+			args: []string{},
+			want: []string{},
+		},
+		{
+			name: "OnlyCwdFlag",
+			args: []string{"-C", "/some/path"},
+			want: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := stripCwdFlag(tt.args)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_ExtensionAction_MissingAnnotation(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{Use: "test"}
+	action := &extensionAction{cmd: cmd}
+	_, err := action.Run(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, internal.ErrExtensionNotFound)
 }

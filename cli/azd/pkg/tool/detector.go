@@ -10,6 +10,7 @@ import (
 	"fmt"
 	osexec "os/exec"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
@@ -30,6 +31,15 @@ type ToolStatus struct {
 	Error error
 }
 
+// InstalledSkillHost pairs an agentic CLI host with the skill version
+// installed through it.
+type InstalledSkillHost struct {
+	// Host is the agentic CLI host binary name (e.g. "copilot").
+	Host string
+	// Version is the skill version installed through that host.
+	Version string
+}
+
 // Detector checks whether tools are installed and extracts their
 // versions.
 type Detector interface {
@@ -47,6 +57,16 @@ type Detector interface {
 		ctx context.Context,
 		tools []*ToolDefinition,
 	) ([]*ToolStatus, error)
+
+	// DetectSkillHosts returns every configured SkillHost the skill is
+	// currently installed through (with the version installed via each),
+	// in manifest order. It returns nil for non-skill tools. The returned
+	// error is non-nil only for context cancellation/timeout while
+	// listing plugins.
+	DetectSkillHosts(
+		ctx context.Context,
+		tool *ToolDefinition,
+	) ([]InstalledSkillHost, error)
 }
 
 type detector struct {
@@ -73,12 +93,14 @@ func (d *detector) DetectTool(
 	switch tool.Category {
 	case ToolCategoryCLI:
 		return d.detectCLI(ctx, tool), nil
-	case ToolCategoryExtension:
-		return d.detectExtension(ctx, tool), nil
+	case ToolCategoryVSCodeExtension:
+		return d.detectVSCodeExtension(ctx, tool), nil
 	case ToolCategoryServer:
-		return d.detectCommandBased(ctx, tool), nil
-	case ToolCategoryLibrary:
-		return d.detectLibrary(ctx, tool), nil
+		return d.detectServer(ctx, tool), nil
+	case ToolCategoryAzdExtension:
+		return d.detectAzdExtension(ctx, tool), nil
+	case ToolCategorySkill:
+		return d.detectSkill(ctx, tool), nil
 	default:
 		return &ToolStatus{Tool: tool}, nil
 	}
@@ -191,10 +213,10 @@ func (d *detector) detectCLI(
 	return status
 }
 
-// detectExtension checks for a VS Code extension by listing
+// detectVSCodeExtension checks for a VS Code extension by listing
 // installed extensions with `code --list-extensions --show-versions`
 // and matching the output against the tool's [ToolDefinition.VersionRegex].
-func (d *detector) detectExtension(
+func (d *detector) detectVSCodeExtension(
 	ctx context.Context,
 	tool *ToolDefinition,
 ) *ToolStatus {
@@ -262,10 +284,9 @@ func (d *detector) detectExtension(
 	return status
 }
 
-// detectCommandBased handles server tools that specify a
-// DetectCommand. If no DetectCommand is configured the tool is
-// reported as not installed.
-func (d *detector) detectCommandBased(
+// detectServer handles server tools that specify a DetectCommand.
+// If no DetectCommand is configured the tool is reported as not installed.
+func (d *detector) detectServer(
 	ctx context.Context,
 	tool *ToolDefinition,
 ) *ToolStatus {
@@ -355,11 +376,11 @@ type azdExtensionEntry struct {
 	InstalledVersion string `json:"installedVersion"`
 }
 
-// detectLibrary handles azd extension (library) tools by parsing JSON
+// detectAzdExtension handles azd extension tools by parsing JSON
 // output from `azd extension list --installed --output json`. It
 // looks for an entry whose `id` matches the tool's [ToolDefinition.Id]
 // and extracts the `installedVersion`.
-func (d *detector) detectLibrary(
+func (d *detector) detectAzdExtension(
 	ctx context.Context,
 	tool *ToolDefinition,
 ) *ToolStatus {
@@ -434,6 +455,128 @@ func (d *detector) detectLibrary(
 	}
 
 	return status
+}
+
+// ---------------------------------------------------------------------------
+// Skill detection
+// ---------------------------------------------------------------------------
+
+// detectSkill checks whether a skill is installed by running each
+// SkillHost's PluginListCommand. A host is reported as having the skill
+// installed only when its PluginName appears in the listing AND its
+// (required) VersionRegex captures a version. Because a host's list
+// command reports every installed plugin, the regex anchors on this
+// skill's identity so another plugin's version is never mistaken for
+// it. The captured group becomes InstalledVersion. Hosts whose binary
+// is not on PATH are skipped silently — a missing host is not an error,
+// it just means the skill cannot be installed through that host.
+func (d *detector) detectSkill(
+	ctx context.Context,
+	tool *ToolDefinition,
+) *ToolStatus {
+	status := &ToolStatus{Tool: tool}
+
+	if len(tool.SkillHosts) == 0 {
+		return status
+	}
+
+	for _, host := range tool.SkillHosts {
+		version, err := d.skillHostVersion(ctx, host)
+		if err != nil {
+			status.Error = err
+			return status
+		}
+		if version != "" {
+			status.Installed = true
+			status.InstalledVersion = version
+			return status
+		}
+	}
+
+	return status
+}
+
+// DetectSkillHosts returns every configured SkillHost the skill is
+// currently installed through (with the version installed via each), in
+// manifest order. Unlike detectSkill (which stops at the first match) it
+// probes all hosts, so callers can act on every install — e.g.
+// `azd tool upgrade` refreshing the skill on each host it was installed
+// to, or per-host install verification.
+func (d *detector) DetectSkillHosts(
+	ctx context.Context,
+	tool *ToolDefinition,
+) ([]InstalledSkillHost, error) {
+	if tool == nil {
+		return nil, errors.New("tool definition must not be nil")
+	}
+	if tool.Category != ToolCategorySkill {
+		return nil, nil
+	}
+
+	var hosts []InstalledSkillHost
+	for _, host := range tool.SkillHosts {
+		version, err := d.skillHostVersion(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if version != "" {
+			hosts = append(hosts, InstalledSkillHost{
+				Host:    host.Host,
+				Version: version,
+			})
+		}
+	}
+	return hosts, nil
+}
+
+// skillHostVersion reports the version of the skill as installed through
+// a single host, or "" when the host is not on PATH, its list command
+// fails, or the skill is not present. The error is non-nil only for
+// context cancellation/timeout.
+//
+// It uses the same two-stage gate as the rest of skill detection to
+// avoid false positives: PluginName must appear in stdout AND
+// VersionRegex must capture a version. The regex anchors on this
+// skill's identity (the azure@azure-skills entry in claude's `plugin
+// list --json` output, or the plugin name in copilot's `plugin list`),
+// so a host that lists other plugins but not this skill is reported as
+// not installed.
+func (d *detector) skillHostVersion(
+	ctx context.Context,
+	host SkillHost,
+) (string, error) {
+	if len(host.PluginListCommand) == 0 || host.PluginName == "" {
+		return "", nil
+	}
+
+	// A host that is not on PATH cannot have the skill installed through
+	// it; skip silently.
+	if err := d.commandRunner.ToolInPath(host.Host); err != nil {
+		return "", nil
+	}
+
+	// Run the list command. If it fails for any reason other than a
+	// context error we cannot reliably tell whether the skill is
+	// installed via this host — fail closed and report not-installed
+	// rather than guessing from the error output (which often echoes the
+	// queried name).
+	result, err := d.commandRunner.Run(ctx, exec.RunArgs{
+		Cmd:  host.Host,
+		Args: host.PluginListCommand,
+	})
+	if err != nil {
+		if isContextErr(err) {
+			return "", fmt.Errorf("listing %s plugins: %w", host.Host, err)
+		}
+		return "", nil
+	}
+
+	// Match only against stdout: stderr is usually diagnostics, not the
+	// canonical listing.
+	if !strings.Contains(result.Stdout, host.PluginName) {
+		return "", nil
+	}
+	return matchVersion(result.Stdout, host.VersionRegex), nil
 }
 
 // ---------------------------------------------------------------------------

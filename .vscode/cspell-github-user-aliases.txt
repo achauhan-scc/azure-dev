@@ -3,7 +3,10 @@ adam-lavrik
 adamra
 AlecAivazis
 alexandair
+amitbhave
+anchenyi
 antriksh
+banrahan
 benbjohnson
 blang
 bmatcuk
@@ -21,6 +24,7 @@ fatih
 fiscaletti
 gofrs
 haoozhang
+huimiu
 isatty
 joho
 karolz
@@ -52,8 +56,11 @@ spboyer
 stretchr
 theckman
 TheEskhaton
+therealjohn
 tidwall
+tmeschter
 tonybaloney
 vivazqu
 weilim
 Yionse
+Zyysurely

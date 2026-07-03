@@ -1,5 +1,30 @@
 # Release History
 
+<!-- cspell:ignore aiohttp -->
+
+## 0.12.0 (2026-06-22)
+
+- [[#8697]](https://github.com/Azure/azure-dev/pull/8697) Add `azd x pack --bundle` (alias `--zip`) to emit a portable bundle `.zip` containing a `registry.json` with relative artifact URLs plus the platform artifacts, installable via `azd extension install <bundle.zip>` without hosting a registry.
+- [[#8550]](https://github.com/Azure/azure-dev/pull/8550) Embed language template dotfiles so generated extensions include a `.gitignore` (the Go template excludes `bin/`).
+- [[#8550]](https://github.com/Azure/azure-dev/pull/8550) Warn during `azd x build` when the local extension source registry is missing or does not contain the extension, since the binaries are installed but the extension would not appear in `azd extension list`.
+- [[#8570]](https://github.com/Azure/azure-dev/pull/8570) Add `--internal` to `azd x init` to scaffold first-party Go extensions in the `Azure/azure-dev` repository, including CI workflows, release pipeline, and a suitable `.github/CODEOWNERS` entry.
+- [[#8531]](https://github.com/Azure/azure-dev/pull/8531) [[#8660]](https://github.com/Azure/azure-dev/pull/8660) Bump the `aiohttp` dependency in Python extension scaffolding from 3.13.4 to 3.14.1.
+
+## 0.11.1 (2026-06-03)
+
+- [[#8498]](https://github.com/Azure/azure-dev/pull/8498) Disable HTML escaping when writing `registry.json` during `azd x publish` and local registry creation.
+
+## 0.11.0 (2026-05-19)
+
+- [[#8197]](https://github.com/Azure/azure-dev/pull/8197) Treat extension metadata warnings as non-fatal during `azd x build`, while keeping required fields and unusable metadata as validation errors.
+- [[#8197]](https://github.com/Azure/azure-dev/pull/8197) Improve `azd x init` validation ordering, warning output, namespace/tag handling including `--tags` for `--no-prompt`, and child process error messages.
+- [[#8197]](https://github.com/Azure/azure-dev/pull/8197) Improve `azd x init` overwrite prompts and generated Go scaffolding, including command metadata and string-escaped extension descriptions.
+- [[#8197]](https://github.com/Azure/azure-dev/pull/8197) Support dependency-only extension packs in `azd x build`, `azd x pack`, and `azd x publish`, including direct dependency-only registry metadata publishing and clear no-artifact messaging.
+- [[#8197]](https://github.com/Azure/azure-dev/pull/8197) Fail `azd x publish` when executable extensions have no matching artifacts instead of publishing an empty artifact map.
+- [[#7956]](https://github.com/Azure/azure-dev/pull/7956) Migrate the extension developer kit to the `azdext` runtime and refresh generated Go extension scaffolding.
+- [[#7982]](https://github.com/Azure/azure-dev/pull/7982) Add `secret` prompt option support to the scaffolded extension gRPC prompt contract.
+- [[#7697]](https://github.com/Azure/azure-dev/pull/7697) Add `.azdxignore` and `.gitignore` support to `azd x watch`.
+
 ## 0.10.0 (2026-03-04)
 
 - [[#6826]](https://github.com/Azure/azure-dev/pull/6826) Handle locked files on Windows during `azd x build` by terminating stale extension processes.

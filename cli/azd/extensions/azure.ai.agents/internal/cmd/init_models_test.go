@@ -7,6 +7,7 @@ import (
 	"azureaiagent/internal/project"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
@@ -33,30 +34,30 @@ func TestResolveNoPromptCapacity(t *testing.T) {
 			wantOk:       true,
 		},
 		{
-			name: "zero capacity defaults to max(minCapacity, 1)",
+			name: "zero capacity defaults to defaultDeploymentCapacity",
 			candidate: &azdext.AiModelDeployment{
 				Capacity: 0,
 				Sku:      &azdext.AiModelSku{MinCapacity: 5},
 			},
-			wantCapacity: 5,
+			wantCapacity: defaultDeploymentCapacity,
 			wantOk:       true,
 		},
 		{
-			name: "zero capacity with zero minCapacity defaults to 1",
+			name: "zero capacity with zero minCapacity defaults to defaultDeploymentCapacity",
 			candidate: &azdext.AiModelDeployment{
 				Capacity: 0,
 				Sku:      &azdext.AiModelSku{MinCapacity: 0},
 			},
-			wantCapacity: 1,
+			wantCapacity: defaultDeploymentCapacity,
 			wantOk:       true,
 		},
 		{
-			name: "negative capacity defaults to max(minCapacity, 1)",
+			name: "negative capacity defaults to defaultDeploymentCapacity",
 			candidate: &azdext.AiModelDeployment{
 				Capacity: -3,
 				Sku:      &azdext.AiModelSku{MinCapacity: 2},
 			},
-			wantCapacity: 2,
+			wantCapacity: defaultDeploymentCapacity,
 			wantOk:       true,
 		},
 		{
@@ -78,12 +79,12 @@ func TestResolveNoPromptCapacity(t *testing.T) {
 			wantOk:       true,
 		},
 		{
-			name: "enforces minCapacity then step alignment",
+			name: "enforces step alignment on defaultDeploymentCapacity",
 			candidate: &azdext.AiModelDeployment{
 				Capacity: 0,
 				Sku:      &azdext.AiModelSku{MinCapacity: 10, CapacityStep: 3},
 			},
-			wantCapacity: 12, // min=10, rounded up to next step of 3
+			wantCapacity: 51, // default=50, rounded up to next step of 3
 			wantOk:       true,
 		},
 		{
@@ -94,6 +95,24 @@ func TestResolveNoPromptCapacity(t *testing.T) {
 			},
 			wantCapacity: 0,
 			wantOk:       false,
+		},
+		{
+			name: "defaultDeploymentCapacity clamped to maxCapacity",
+			candidate: &azdext.AiModelDeployment{
+				Capacity: 0,
+				Sku:      &azdext.AiModelSku{MaxCapacity: 30},
+			},
+			wantCapacity: 30,
+			wantOk:       true,
+		},
+		{
+			name: "defaultDeploymentCapacity clamped and step-aligned down",
+			candidate: &azdext.AiModelDeployment{
+				Capacity: 0,
+				Sku:      &azdext.AiModelSku{MaxCapacity: 50, CapacityStep: 7},
+			},
+			wantCapacity: 49, // 50/7=7*7=49
+			wantOk:       true,
 		},
 		{
 			name: "exceeds remaining quota returns false",
@@ -261,4 +280,101 @@ func TestPersistFirstDeploymentName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUpdateEnvLocation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		selectedLocation string
+		existingContext  *azdext.AzureContext
+		wantLocation     string // expected azureContext.Scope.Location after call
+	}{
+		{
+			name:             "sets AZURE_AI_DEPLOYMENTS_LOCATION and updates azureContext",
+			selectedLocation: "westus2",
+			existingContext:  &azdext.AzureContext{Scope: &azdext.AzureScope{Location: "eastus"}},
+			wantLocation:     "westus2",
+		},
+		{
+			name:             "nil azureContext gets initialized",
+			selectedLocation: "swedencentral",
+			existingContext:  nil,
+			wantLocation:     "swedencentral",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			envName := "test-env"
+			envServer := &testEnvironmentServiceServer{
+				values: map[string]map[string]string{
+					envName: {},
+				},
+			}
+			azdClient := newTestAzdClient(t, envServer, &testWorkflowServiceServer{})
+
+			ms := &modelSelector{
+				azdClient:    azdClient,
+				environment:  &azdext.Environment{Name: envName},
+				azureContext: tt.existingContext,
+			}
+
+			err := ms.updateEnvLocation(t.Context(), tt.selectedLocation)
+			require.NoError(t, err)
+
+			// Verify env var was persisted
+			assert.Equal(t, tt.selectedLocation, envServer.values[envName]["AZURE_AI_DEPLOYMENTS_LOCATION"])
+
+			// Verify azureContext was updated
+			require.NotNil(t, ms.azureContext)
+			require.NotNil(t, ms.azureContext.Scope)
+			assert.Equal(t, tt.wantLocation, ms.azureContext.Scope.Location)
+		})
+	}
+}
+
+func TestExistingDeploymentError(t *testing.T) {
+	t.Parallel()
+
+	deployment := &project.Deployment{
+		Name: "my-gpt4",
+		Model: project.DeploymentModel{
+			Name:    "gpt-4",
+			Format:  "OpenAI",
+			Version: "2024-05-13",
+		},
+		Sku: project.DeploymentSku{
+			Name:     "Standard",
+			Capacity: 10,
+		},
+	}
+
+	t.Run("errors.As unwraps existingDeploymentError", func(t *testing.T) {
+		t.Parallel()
+
+		err := &existingDeploymentError{Deployment: deployment}
+		wrapped := fmt.Errorf("outer: %w", err)
+
+		existing, ok := errors.AsType[*existingDeploymentError](wrapped)
+		require.True(t, ok)
+		assert.Equal(t, deployment, existing.Deployment)
+	})
+
+	t.Run("Error returns descriptive message", func(t *testing.T) {
+		t.Parallel()
+
+		err := &existingDeploymentError{Deployment: deployment}
+		assert.Equal(t, "user selected existing deployment", err.Error())
+	})
+
+	t.Run("does not match errModelSkipped", func(t *testing.T) {
+		t.Parallel()
+
+		err := &existingDeploymentError{Deployment: deployment}
+		assert.False(t, errors.Is(err, errModelSkipped))
+	})
 }

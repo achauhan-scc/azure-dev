@@ -1,13 +1,33 @@
 import: ../../../.vscode/cspell.global.yaml
 words:
+  - braydonk
+  - osutil
+  - upserted
+  - upserting
+  - upserts
+  - yamlnode
   - agentcopilot
   - agentdetect
   - Authenticode
   - azdignore
+  - borderless
   - gofmt
   - golangci
+  - golangtools
   - lightspeed
+  - runewidth
   - toplevel
+  - truncatable
+  - wrappable
+  - myacr
+  - myconn
+  - myorg
+  - myprivacr
+  - privatelink
+  - cheatsheet
+  - aerr
+  - rerr
+  - perr
   - azcloud
   - azdext
   - azdxignore
@@ -32,6 +52,8 @@ words:
   - errorhandler
   - extendee
   - eiannone
+  - firstrun
+  - CICD
   # CDN host name
   - gfgac2cmf7b8cuay
   - Getenv
@@ -42,6 +64,7 @@ words:
   - opencode
   - grpcbroker
   - msiexec
+  - manylinux
   - nosec
   - npx
   - oneof
@@ -331,12 +354,6 @@ overrides:
   - filename: pkg/extensions/manager.go
     words:
       - myext
-  - filename: extensions/microsoft.azd.extensions/internal/resources/languages/**/.gitignore
-    words:
-      - rsuser
-      - userosscache
-      - docstates
-      - dylib
   - filename: docs/recording-functional-tests-guide.md
     words:
       - httptest
@@ -473,6 +490,17 @@ overrides:
     words:
       - extensionquery
       - bitmask
+  - filename: pkg/infra/provisioning/bicep/bicep_provider.go
+    words:
+      - azurekubernetesservicechaosmesh
+  - filename: AGENTS.md
+    words:
+      - forbidigo
+      - Logf
+  - filename: .golangci.yaml
+    words:
+      - forbidigo
+      - Logf
 ignorePaths:
   - "**/*_test.go"
   - "**/mock*.go"

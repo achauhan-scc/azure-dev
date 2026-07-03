@@ -121,6 +121,18 @@ template:
   protocols:
     - protocol: invocations
       version: 1.0.0
+  agent_endpoint:
+    protocols:
+      - responses
+    authorization_schemes:
+      - type: Entra
+        isolation_key_source:
+          kind: Header
+  agent_card:
+    description: image-agent card
+    skills:
+      - name: chat
+        description: Basic chat capability
 `)
 
 	agent, err := ExtractAgentDefinition(yamlContent)
@@ -135,6 +147,19 @@ template:
 
 	if containerAgent.Image != "myregistry.azurecr.io/myimage:v1" {
 		t.Errorf("Expected image 'myregistry.azurecr.io/myimage:v1', got '%s'", containerAgent.Image)
+	}
+
+	if containerAgent.AgentEndpoint == nil {
+		t.Fatal("Expected AgentEndpoint to be set, got nil")
+	}
+	if len(containerAgent.AgentEndpoint.AuthorizationSchemes) != 1 ||
+		containerAgent.AgentEndpoint.AuthorizationSchemes[0].IsolationKeySource == nil ||
+		containerAgent.AgentEndpoint.AuthorizationSchemes[0].IsolationKeySource.Kind != "Header" {
+		t.Errorf("Expected isolation_key_source.kind 'Header', got %+v",
+			containerAgent.AgentEndpoint.AuthorizationSchemes)
+	}
+	if containerAgent.AgentCard == nil || containerAgent.AgentCard.Description != "image-agent card" {
+		t.Errorf("Expected agent_card.description 'image-agent card', got %+v", containerAgent.AgentCard)
 	}
 
 	marshaled, err := yaml.Marshal(containerAgent)
@@ -577,6 +602,8 @@ func TestExtractResourceDefinitions_ConnectionAllAuthTypes(t *testing.T) {
 		AuthTypeNone,
 		AuthTypeOAuth2,
 		AuthTypePAT,
+		AuthTypeAgenticIdentity,
+		AuthTypeAgenticIdentityToken,
 	}
 
 	for _, authType := range authTypes {
@@ -1070,5 +1097,92 @@ resources:
 
 	if localErr.Suggestion == "" {
 		t.Error("Expected a non-empty suggestion")
+	}
+}
+
+func TestValidateAgentDefinition_RaiConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		yaml         string
+		wantErrSubst string
+	}{
+		{
+			name: "valid rai_policy",
+			yaml: `kind: hosted
+name: rai-agent
+policies:
+  - type: rai_policy
+    rai_policy_name: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/my-rg/providers/Microsoft.CognitiveServices/accounts/my-account/raiPolicies/Microsoft.DefaultV2
+protocols:
+  - protocol: responses
+    version: "1.0.0"
+`,
+		},
+		{
+			name: "rai_policy missing policy name",
+			yaml: `kind: hosted
+name: rai-agent
+policies:
+  - type: rai_policy
+protocols:
+  - protocol: responses
+    version: "1.0.0"
+`,
+			wantErrSubst: "policies[0] of type 'rai_policy' requires a policy name",
+		},
+		{
+			name: "policy missing type",
+			yaml: `kind: hosted
+name: rai-agent
+policies:
+  - rai_policy_name: /subscriptions/x/raiPolicies/p
+protocols:
+  - protocol: responses
+    version: "1.0.0"
+`,
+			wantErrSubst: "policies[0] requires a type",
+		},
+		{
+			name: "unsupported policy type",
+			yaml: `kind: hosted
+name: rai-agent
+policies:
+  - type: network_policy
+protocols:
+  - protocol: responses
+    version: "1.0.0"
+`,
+			wantErrSubst: "policies[0] has an unsupported type 'network_policy'",
+		},
+		{
+			name: "no policies",
+			yaml: `kind: hosted
+name: rai-agent
+protocols:
+  - protocol: responses
+    version: "1.0.0"
+`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateAgentDefinition([]byte(tc.yaml))
+			if tc.wantErrSubst == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubst)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubst) {
+				t.Fatalf("expected error containing %q, got %q", tc.wantErrSubst, err.Error())
+			}
+		})
 	}
 }

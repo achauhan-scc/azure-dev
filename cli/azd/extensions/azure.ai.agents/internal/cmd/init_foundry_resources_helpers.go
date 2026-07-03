@@ -6,9 +6,9 @@ package cmd
 import (
 	"azureaiagent/internal/exterrors"
 	"azureaiagent/internal/pkg/azure"
-	"azureaiagent/internal/project"
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"slices"
 	"strings"
@@ -34,6 +34,20 @@ type FoundryProjectInfo struct {
 	ProjectName       string
 	Location          string // may be empty when parsed from resource ID alone
 	ResourceId        string // full ARM resource ID
+	// NetworkInjected is true when the owning Foundry account has VNET network
+	// injection (agent scenario); used to disable remote build.
+	NetworkInjected bool
+}
+
+// Endpoint returns the Foundry project data-plane endpoint derived from the
+// account and project names, or "" when the project is nil or either name is
+// missing. The endpoint is the brownfield signal written onto the
+// azure.ai.project service so provision connects to the existing project.
+func (p *FoundryProjectInfo) Endpoint() string {
+	if p == nil || p.AccountName == "" || p.ProjectName == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://%s.services.ai.azure.com/api/projects/%s", p.AccountName, p.ProjectName)
 }
 
 // FoundryDeploymentInfo holds information about an existing model deployment in a Foundry project.
@@ -60,6 +74,23 @@ func setEnvValue(ctx context.Context, azdClient *azdext.AzdClient, envName, key,
 	}
 
 	return nil
+}
+
+// getEnvValue retrieves a single environment variable value. Returns empty string if not found.
+func getEnvValue(ctx context.Context, azdClient *azdext.AzdClient, envName, key string) (string, error) {
+	envValues, err := azdClient.Environment().GetValues(ctx, &azdext.GetEnvironmentRequest{
+		Name: envName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get environment values: %w", err)
+	}
+
+	for _, kv := range envValues.KeyValues {
+		if kv.Key == key {
+			return kv.Value, nil
+		}
+	}
+	return "", nil
 }
 
 // projectResourceIdRegex is the precompiled regex for parsing Foundry project ARM resource IDs.
@@ -196,12 +227,14 @@ func getFoundryProject(
 		return nil, fmt.Errorf("provided project resource ID does not match the selected subscription")
 	}
 
-	projectsClient, err := armcognitiveservices.NewProjectsClient(project.SubscriptionId, credential, azure.NewArmClientOptions())
+	projectsClient, err := armcognitiveservices.NewProjectsClient(
+		project.SubscriptionId, credential, azure.NewArmClientOptions())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create projects client: %w", err)
 	}
 
-	response, err := projectsClient.Get(ctx, project.ResourceGroupName, project.AccountName, project.ProjectName, nil)
+	response, err := projectsClient.Get(
+		ctx, project.ResourceGroupName, project.AccountName, project.ProjectName, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Foundry project: %w", err)
 	}
@@ -209,6 +242,45 @@ func getFoundryProject(
 	updateFoundryProjectInfo(project, &response.Project)
 
 	return project, nil
+}
+
+// foundryAccountNetworkInjected reports whether the Foundry account that owns the
+// project has VNET network injection (agent scenario), used to disable remote
+// build. Best-effort: any failure returns false with a logged warning so init is
+// never blocked.
+func foundryAccountNetworkInjected(
+	ctx context.Context,
+	credential azcore.TokenCredential,
+	project *FoundryProjectInfo,
+) bool {
+	accountsClient, err := armcognitiveservices.NewAccountsClient(
+		project.SubscriptionId, credential, azure.NewArmClientOptions())
+	if err != nil {
+		log.Printf("warning: could not create Cognitive Services accounts client for "+
+			"network-injection check, assuming no injection: %v", err)
+		return false
+	}
+
+	response, err := accountsClient.Get(ctx, project.ResourceGroupName, project.AccountName, nil)
+	if err != nil {
+		log.Printf("warning: could not read Foundry account '%s' for network-injection "+
+			"check, assuming no injection: %v", project.AccountName, err)
+		return false
+	}
+
+	props := response.Account.Properties
+	if props == nil {
+		return false
+	}
+
+	for _, injection := range props.NetworkInjections {
+		if injection != nil && injection.Scenario != nil &&
+			*injection.Scenario == armcognitiveservices.ScenarioTypeAgent {
+			return true
+		}
+	}
+
+	return false
 }
 
 // listProjectDeployments lists all model deployments in a Foundry account.
@@ -310,6 +382,9 @@ func lookupAcrResourceId(
 // configureFoundryProjectEnv sets all Foundry project environment variables and discovers
 // ACR and AppInsights connections. This is the shared implementation used by both init flows.
 // When skipACR is true, ACR connection discovery and configuration is skipped (used for code deploy).
+// When bicepless is true, AppInsights is left to the provisioning provider; ACR is still configured
+// for a container agent (skipACR false) so its endpoint is wired here when the project already has a
+// registry connection, or the provider is signaled to create one on provision (the create-new path).
 func configureFoundryProjectEnv(
 	ctx context.Context,
 	azdClient *azdext.AzdClient,
@@ -318,6 +393,7 @@ func configureFoundryProjectEnv(
 	project FoundryProjectInfo,
 	subscriptionId string,
 	skipACR bool,
+	bicepless bool,
 ) error {
 	resourceId := project.ResourceId
 	if resourceId == "" {
@@ -342,14 +418,23 @@ func configureFoundryProjectEnv(
 		return err
 	}
 
-	aiFoundryEndpoint := fmt.Sprintf("https://%s.services.ai.azure.com/api/projects/%s", project.AccountName, project.ProjectName)
-	if err := setEnvValue(ctx, azdClient, envName, "AZURE_AI_PROJECT_ENDPOINT", aiFoundryEndpoint); err != nil {
+	aiFoundryEndpoint := project.Endpoint()
+	if err := setEnvValue(ctx, azdClient, envName, "FOUNDRY_PROJECT_ENDPOINT", aiFoundryEndpoint); err != nil {
 		return err
 	}
 
 	aoaiEndpoint := fmt.Sprintf("https://%s.openai.azure.com/", project.AccountName)
 	if err := setEnvValue(ctx, azdClient, envName, "AZURE_OPENAI_ENDPOINT", aoaiEndpoint); err != nil {
 		return err
+	}
+
+	if bicepless {
+		// The provisioning provider owns ACR/AppInsights for a new project, but a
+		// container agent on an existing project needs a registry it won't create.
+		if skipACR {
+			return nil
+		}
+		return configureExistingProjectAcr(ctx, azdClient, credential, envName, project, subscriptionId)
 	}
 
 	// Discover and configure connections (ACR, AppInsights)
@@ -397,6 +482,39 @@ func configureFoundryProjectEnv(
 	return nil
 }
 
+// configureExistingProjectAcr discovers the ACR connections on an existing
+// Foundry project and runs the ACR selection/question for a container agent in
+// the bicepless flow. A failure to list connections is non-fatal: configureAcrConnection
+// then prompts for a login server (or to create one during provision).
+func configureExistingProjectAcr(
+	ctx context.Context,
+	azdClient *azdext.AzdClient,
+	credential azcore.TokenCredential,
+	envName string,
+	project FoundryProjectInfo,
+	subscriptionId string,
+) error {
+	var acrConnections []azure.Connection
+	foundryClient, err := azure.NewFoundryProjectsClient(project.AccountName, project.ProjectName, credential)
+	if err != nil {
+		return fmt.Errorf("creating Foundry client: %w", err)
+	}
+	connections, err := foundryClient.GetAllConnections(ctx)
+	if err != nil {
+		fmt.Printf(
+			"Could not get Microsoft Foundry project connections: %v. "+
+				"You will be asked to provide a container registry.\n", err)
+	} else {
+		for _, conn := range connections {
+			if conn.Type == azure.ConnectionTypeContainerRegistry {
+				acrConnections = append(acrConnections, conn)
+			}
+		}
+	}
+
+	return configureAcrConnection(ctx, azdClient, credential, envName, subscriptionId, acrConnections)
+}
+
 // configureAcrConnection handles ACR connection selection and env var setting.
 func configureAcrConnection(
 	ctx context.Context,
@@ -438,6 +556,13 @@ func configureAcrConnection(
 			if err := setEnvValue(ctx, azdClient, envName, "AZURE_CONTAINER_REGISTRY_RESOURCE_ID", resourceId); err != nil {
 				return err
 			}
+			if err := updatePendingACRSignal(ctx, azdClient, envName, true); err != nil {
+				log.Printf("warning: failed to update acr provision signal: %v", err)
+			}
+		} else {
+			if err := updatePendingACRSignal(ctx, azdClient, envName, false); err != nil {
+				log.Printf("warning: failed to update acr provision signal: %v", err)
+			}
 		}
 		return nil
 	}
@@ -478,8 +603,38 @@ func configureAcrConnection(
 	if err := setEnvValue(ctx, azdClient, envName, "AZURE_CONTAINER_REGISTRY_ENDPOINT", normalizeLoginServer(selectedConnection.Target)); err != nil {
 		return err
 	}
+	if err := updatePendingACRSignal(ctx, azdClient, envName, true); err != nil {
+		log.Printf("warning: failed to update acr provision signal: %v", err)
+	}
 
 	return nil
+}
+
+// tracingOverviewURL points to an overview of agent tracing/telemetry behavior.
+const tracingOverviewURL = "https://aka.ms/tracing-overview"
+
+// disableTracingURL points to guidance on disabling agent tracing/telemetry.
+const disableTracingURL = "https://aka.ms/disable-tracing"
+
+// tracingDisclaimer returns the telemetry/tracing disclaimer shown during init
+// wherever Application Insights is connected or added. The body is rendered in a
+// muted (gray) style. The "Learn more" label renders as a clickable hyperlink to
+// tracingOverviewURL (and as the plain URL in non-terminal output), and
+// disableTracingURL renders as a clickable hyperlink in a terminal and as the
+// plain URL in non-terminal output.
+func tracingDisclaimer() string {
+	return output.WithGrayFormat(
+		"When using Hosted Agents apply appropriate safeguards. "+
+			"You are responsible for managing all data that may flow outside "+
+			"your organization's compliance and geographic boundaries. "+
+			"Use third-party systems at your own risk. ") +
+		output.WithHyperlink(tracingOverviewURL, "Learn more") +
+		output.WithGrayFormat(
+			". When AppInsights is enabled, this project logs traces to help "+
+				"you monitor your agents. Certain project members may be able to "+
+				"view user data. See ") +
+		output.WithHyperlink(disableTracingURL, disableTracingURL) +
+		output.WithGrayFormat(".")
 }
 
 // configureAppInsightsConnection handles AppInsights connection selection and env var setting.
@@ -489,14 +644,19 @@ func configureAppInsightsConnection(
 	envName string,
 	appInsightsConnections []azure.Connection,
 ) error {
+	// Show the tracing/telemetry disclaimer once, before any branch, since each
+	// path below connects or adds an Application Insights resource.
+	fmt.Println(tracingDisclaimer())
+	fmt.Println()
+
 	if len(appInsightsConnections) == 0 {
-		fmt.Println("\n" +
+		fmt.Println(
 			"Application Insights (optional)\n\n" +
-			"Enable telemetry to collect logs, traces, and diagnostics for this agent.\n\n" +
-			"You can:\n" +
-			"  • Use an existing Application Insights resource\n" +
-			"  • Or create a new one during 'azd up'\n\n" +
-			"Docs: " + output.WithLinkFormat("https://aka.ms/azdaiagent/docs"))
+				"Enable telemetry to collect logs, traces, and diagnostics for this agent.\n\n" +
+				"You can:\n" +
+				"  • Use an existing Application Insights resource\n" +
+				"  • Or create a new one during 'azd up'\n\n" +
+				"Docs: " + output.WithLinkFormat("https://aka.ms/azdaiagent/docs"))
 
 		resourceIdResp, err := azdClient.Prompt().Prompt(ctx, &azdext.PromptRequest{
 			Options: &azdext.PromptOptions{
@@ -527,6 +687,13 @@ func configureAppInsightsConnection(
 				if err := setEnvValue(ctx, azdClient, envName, "APPLICATIONINSIGHTS_CONNECTION_STRING", connStrResp.Value); err != nil {
 					return err
 				}
+			}
+			if err := updatePendingAppInsightsSignal(ctx, azdClient, envName, true); err != nil {
+				log.Printf("warning: failed to update app_insights provision signal: %v", err)
+			}
+		} else {
+			if err := updatePendingAppInsightsSignal(ctx, azdClient, envName, false); err != nil {
+				log.Printf("warning: failed to update app_insights provision signal: %v", err)
 			}
 		}
 		return nil
@@ -570,6 +737,9 @@ func configureAppInsightsConnection(
 			ctx, azdClient, envName, "APPLICATIONINSIGHTS_CONNECTION_STRING", selectedConnection.Credentials.Key,
 		); err != nil {
 			return err
+		}
+		if err := updatePendingAppInsightsSignal(ctx, azdClient, envName, true); err != nil {
+			log.Printf("warning: failed to update app_insights provision signal: %v", err)
 		}
 	}
 
@@ -661,14 +831,114 @@ func loadAzureContext(
 		envValueMap[value.Key] = value.Value
 	}
 
+	// Prefer AZURE_AI_DEPLOYMENTS_LOCATION for model/project operations;
+	// fall back to AZURE_LOCATION for backward compatibility.
+	location := envValueMap["AZURE_AI_DEPLOYMENTS_LOCATION"]
+	if location == "" {
+		location = envValueMap["AZURE_LOCATION"]
+	}
+
 	return &azdext.AzureContext{
 		Scope: &azdext.AzureScope{
 			TenantId:       envValueMap["AZURE_TENANT_ID"],
 			SubscriptionId: envValueMap["AZURE_SUBSCRIPTION_ID"],
-			Location:       envValueMap["AZURE_LOCATION"],
+			Location:       location,
 		},
 		Resources: []string{},
 	}, nil
+}
+
+func missingInitAzureContextValues(azureContext *azdext.AzureContext) []string {
+	var missing []string
+	if azureContext == nil || azureContext.Scope == nil {
+		return []string{"AZURE_SUBSCRIPTION_ID", "AZURE_LOCATION"}
+	}
+	if strings.TrimSpace(azureContext.Scope.SubscriptionId) == "" {
+		missing = append(missing, "AZURE_SUBSCRIPTION_ID")
+	}
+	if strings.TrimSpace(azureContext.Scope.Location) == "" {
+		missing = append(missing, "AZURE_LOCATION")
+	}
+	return missing
+}
+
+func shouldDeferInitAzureContext(noPrompt bool, azureContext *azdext.AzureContext) bool {
+	return noPrompt && len(missingInitAzureContextValues(azureContext)) > 0
+}
+
+func configureDeferredInitAzureContext(
+	ctx context.Context,
+	azdClient *azdext.AzdClient,
+	envName string,
+	azureContext *azdext.AzureContext,
+	hasModelResources bool,
+) error {
+	missing := missingInitAzureContextValues(azureContext)
+	fmt.Printf("%s", output.WithWarningFormat(
+		"Missing Azure environment values: %s. Continuing because --no-prompt was specified.\n",
+		strings.Join(missing, ", "),
+	))
+	fmt.Println(output.WithGrayFormat("Set the missing values before running azd provision or azd deploy:"))
+	if slices.Contains(missing, "AZURE_SUBSCRIPTION_ID") {
+		fmt.Println(output.WithGrayFormat("  azd env set AZURE_SUBSCRIPTION_ID <subscription-id>"))
+	}
+	if slices.Contains(missing, "AZURE_LOCATION") {
+		fmt.Println(output.WithGrayFormat("  azd env set AZURE_LOCATION <region>"))
+		fmt.Println(output.WithGrayFormat(
+			"  # Optional: azd env set AZURE_AI_DEPLOYMENTS_LOCATION <region>",
+		))
+	}
+	if hasModelResources {
+		fmt.Printf("%s", output.WithWarningFormat(
+			"Model resource configuration was deferred because model lookup requires the missing Azure values.\n",
+		))
+		fmt.Println(output.WithGrayFormat(
+			"Set the missing values, then re-run init to resolve model deployments automatically.",
+		))
+		fmt.Println(output.WithGrayFormat(
+			"To configure deployments manually, add a deployment under the agent service config in azure.yaml, for example:",
+		))
+		fmt.Println(output.WithGrayFormat("  deployments:"))
+		fmt.Println(output.WithGrayFormat("    - name: <deployment-name>"))
+		fmt.Println(output.WithGrayFormat("      model:"))
+		fmt.Println(output.WithGrayFormat("        name: <model-name>"))
+		fmt.Println(output.WithGrayFormat("        format: OpenAI"))
+		fmt.Println(output.WithGrayFormat("        version: <model-version>"))
+		fmt.Println(output.WithGrayFormat("      sku:"))
+		fmt.Println(output.WithGrayFormat("        name: GlobalStandard"))
+		fmt.Println(output.WithGrayFormat("        capacity: 1"))
+	}
+
+	if err := setEnvValue(ctx, azdClient, envName, "USE_EXISTING_AI_PROJECT", "false"); err != nil {
+		return fmt.Errorf("failed to set USE_EXISTING_AI_PROJECT: %w", err)
+	}
+	if err := updatePendingProjectSignal(ctx, azdClient, envName, false); err != nil {
+		log.Printf("warning: failed to update project provision signal: %v", err)
+	}
+
+	return nil
+}
+
+func configureNewProjectForNoPrompt(
+	ctx context.Context,
+	azdClient *azdext.AzdClient,
+	envName string,
+	azureContext *azdext.AzureContext,
+	subscriptionMessage string,
+) (azcore.TokenCredential, error) {
+	newCred, err := ensureSubscriptionAndLocation(ctx, azdClient, azureContext, envName, subscriptionMessage)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := setEnvValue(ctx, azdClient, envName, "USE_EXISTING_AI_PROJECT", "false"); err != nil {
+		return nil, fmt.Errorf("failed to set USE_EXISTING_AI_PROJECT: %w", err)
+	}
+	if err := updatePendingProjectSignal(ctx, azdClient, envName, false); err != nil {
+		log.Printf("warning: failed to update project provision signal: %v", err)
+	}
+
+	return newCred, nil
 }
 
 // --- Shared subscription/location helpers ---
@@ -676,6 +946,11 @@ func loadAzureContext(
 // ensureSubscription prompts for a subscription if not already set in the AzureContext.
 // If a subscription is already set, looks up the tenant for it. Returns the (possibly refreshed)
 // credential scoped to the resolved tenant. Both init flows use this.
+//
+// When the prompt fails (e.g. running under `--no-prompt` without
+// `AZURE_SUBSCRIPTION_ID` set), the error is wrapped with a structured
+// suggestion naming the env var to set so headless callers get an actionable
+// message instead of a generic "prompt required".
 func ensureSubscription(
 	ctx context.Context,
 	azdClient *azdext.AzdClient,
@@ -691,7 +966,24 @@ func ensureSubscription(
 			if exterrors.IsCancellation(err) {
 				return nil, exterrors.Cancelled("subscription selection was cancelled")
 			}
-			return nil, exterrors.FromPrompt(err, "failed to prompt for subscription")
+			// Only attach the AZURE_SUBSCRIPTION_ID-specific guidance when the
+			// failure is the no-prompt / "prompt required" path. Other prompt
+			// failures (e.g. host transport errors) get a generic message so we
+			// don't mislead the user into setting an env var that wouldn't have
+			// helped.
+			if exterrors.IsPromptRequired(err) {
+				return nil, exterrors.Dependency(
+					exterrors.CodeMissingAzureSubscription,
+					fmt.Sprintf("failed to select an Azure subscription: %s", err),
+					"set AZURE_SUBSCRIPTION_ID in your azd environment "+
+						"(run `azd env set AZURE_SUBSCRIPTION_ID <id>`), or run interactively to pick one",
+				)
+			}
+			return nil, exterrors.Dependency(
+				exterrors.CodeMissingAzureSubscription,
+				fmt.Sprintf("failed to select an Azure subscription: %s", err),
+				"retry, or run interactively to pick one",
+			)
 		}
 
 		azureContext.Scope.SubscriptionId = subscriptionResponse.Subscription.Id
@@ -748,11 +1040,19 @@ func ensureLocation(
 	}
 
 	if azureContext.Scope.Location != "" && locationAllowed(azureContext.Scope.Location, allowedLocations) {
+		if err := setEnvValue(ctx, azdClient, envName, "AZURE_AI_DEPLOYMENTS_LOCATION", azureContext.Scope.Location); err != nil {
+			return err
+		}
+		// Defensively seed AZURE_LOCATION (resource group location) if not already set,
+		// so that downstream provisioning always has a valid location.
+		if existing, _ := getEnvValue(ctx, azdClient, envName, "AZURE_LOCATION"); existing == "" {
+			return setEnvValue(ctx, azdClient, envName, "AZURE_LOCATION", azureContext.Scope.Location)
+		}
 		return nil
 	}
 	if azureContext.Scope.Location != "" {
 		fmt.Printf("%s", output.WithWarningFormat(
-			"The current AZURE_LOCATION '%s' is not supported for this agent setup. Please choose a different location.\n",
+			"The current location '%s' is not supported for this agent setup. Please choose a different location.\n",
 			azureContext.Scope.Location,
 		))
 		azureContext.Scope.Location = ""
@@ -767,7 +1067,13 @@ func ensureLocation(
 
 	azureContext.Scope.Location = locationName
 
-	return setEnvValue(ctx, azdClient, envName, "AZURE_LOCATION", azureContext.Scope.Location)
+	// Set both AZURE_LOCATION (resource group) and AZURE_AI_DEPLOYMENTS_LOCATION (model/project resources)
+	// to the same value by default. AZURE_AI_DEPLOYMENTS_LOCATION can be changed independently later
+	// (e.g. during model selection) without affecting the resource group location.
+	if err := setEnvValue(ctx, azdClient, envName, "AZURE_LOCATION", azureContext.Scope.Location); err != nil {
+		return err
+	}
+	return setEnvValue(ctx, azdClient, envName, "AZURE_AI_DEPLOYMENTS_LOCATION", azureContext.Scope.Location)
 }
 
 // ensureSubscriptionAndLocation ensures both subscription and location are set.
@@ -820,7 +1126,15 @@ func promptLocationForInit(
 		if exterrors.IsCancellation(err) {
 			return "", exterrors.Cancelled("location selection was cancelled")
 		}
-		return "", exterrors.FromPrompt(err, "failed to prompt for location")
+		// Wrap with an actionable suggestion so headless callers (--no-prompt)
+		// learn how to supply the value instead of getting a generic
+		// "prompt required" propagated from the azd host.
+		return "", exterrors.Dependency(
+			exterrors.CodeLocationMismatch,
+			fmt.Sprintf("failed to select an Azure location: %s", err),
+			"set AZURE_LOCATION in your azd environment "+
+				"(`azd env set AZURE_LOCATION <region>`) or run interactively to pick one",
+		)
 	}
 
 	return locationResponse.Location.Name, nil
@@ -871,7 +1185,15 @@ func selectNewModel(
 
 	modelResp, err := azdClient.Prompt().PromptAiModel(ctx, promptReq)
 	if err != nil {
-		return nil, exterrors.FromPrompt(err, "failed to prompt for model selection")
+		if exterrors.IsCancellation(err) {
+			return nil, exterrors.Cancelled("model selection was cancelled")
+		}
+		return nil, exterrors.Dependency(
+			exterrors.CodeModelResolutionFailed,
+			fmt.Sprintf("failed to select an AI model: %s", err),
+			"pass --model <name> (e.g. --model gpt-4.1-mini) or --project-id "+
+				"<id> with --model-deployment <name> to skip interactive model selection",
+		)
 	}
 
 	return modelResp.Model, nil
@@ -891,6 +1213,7 @@ func resolveModelDeployments(
 		ModelName:    model.Name,
 		Options: &azdext.AiModelDeploymentOptions{
 			Locations: []string{location},
+			Capacity:  new(defaultDeploymentCapacity),
 		},
 		Quota: &azdext.QuotaCheckOptions{
 			MinRemainingCapacity: 1,
@@ -998,6 +1321,9 @@ func sortModelDeploymentCandidates(candidates []*azdext.AiModelDeployment, defau
 // finds the matching project without prompting. Returns nil if user chose
 // "Create a new Foundry project" or no projects exist.
 // When a project is selected, configures all project-related environment variables.
+// skipACR skips ACR connection discovery (used for code deploy);
+// bicepless skips both ACR and AppInsights prompts (see
+// configureFoundryProjectEnv).
 func selectFoundryProject(
 	ctx context.Context,
 	azdClient *azdext.AzdClient,
@@ -1007,6 +1333,7 @@ func selectFoundryProject(
 	subscriptionId string,
 	projectResourceId string,
 	skipACR bool,
+	bicepless bool,
 ) (*FoundryProjectInfo, error) {
 	spinnerText := "Searching for Foundry projects in your subscription..."
 	if projectResourceId != "" {
@@ -1044,11 +1371,21 @@ func selectFoundryProject(
 		return nil, fmt.Errorf("failed to list Foundry projects: %w", err)
 	}
 
-	// When code deploy is selected, restrict to regions that support it.
+	// When ACR is skipped (code deploy, or a pre-built --image), the agent runs as a
+	// hosted agent, so restrict to regions that support hosted agents.
 	if skipACR {
-		projects = slices.DeleteFunc(projects, func(p FoundryProjectInfo) bool {
-			return !locationAllowed(p.Location, project.CodeDeployRegions)
-		})
+		supportedRegions, regErr := supportedRegionsForInit(ctx)
+		if regErr != nil {
+			// Propagate context cancellation/timeout — these are not recoverable fetch failures.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			log.Printf("warning: failed to fetch supported regions, skipping code-deploy region filter: %v", regErr)
+		} else if len(supportedRegions) > 0 {
+			projects = slices.DeleteFunc(projects, func(p FoundryProjectInfo) bool {
+				return !locationAllowed(p.Location, supportedRegions)
+			})
+		}
 	}
 
 	if len(projects) == 0 {
@@ -1090,7 +1427,12 @@ func selectFoundryProject(
 			if exterrors.IsCancellation(err) {
 				return nil, exterrors.Cancelled("project selection was cancelled")
 			}
-			return nil, fmt.Errorf("failed to prompt for project selection: %w", err)
+			return nil, exterrors.Dependency(
+				exterrors.CodeMissingAiProjectId,
+				fmt.Sprintf("failed to select a Foundry project: %s", err),
+				"pass --project-id <full resource id> to skip interactive project selection, "+
+					"or run interactively to choose from the discovered projects",
+			)
 		}
 
 		selectedIdx = *projectResp.Value
@@ -1103,14 +1445,30 @@ func selectFoundryProject(
 
 	selectedProject := projects[selectedIdx]
 
+	// Resolve the account's VNET network-injection status for the chosen project
+	// (best-effort) so remote build is disabled when injection is present. Done here
+	// so both the provided-id and interactive-picker paths are covered from one place.
+	selectedProject.NetworkInjected = foundryAccountNetworkInjected(ctx, credential, &selectedProject)
+
 	// Set location from the selected project
 	azureContext.Scope.Location = selectedProject.Location
-	if err := setEnvValue(ctx, azdClient, envName, "AZURE_LOCATION", selectedProject.Location); err != nil {
-		return nil, fmt.Errorf("failed to set AZURE_LOCATION: %w", err)
+	if err := setEnvValue(ctx, azdClient, envName, "AZURE_AI_DEPLOYMENTS_LOCATION", selectedProject.Location); err != nil {
+		return nil, fmt.Errorf("failed to set AZURE_AI_DEPLOYMENTS_LOCATION: %w", err)
+	}
+	// Seed AZURE_LOCATION (used for resource group) only if not already set.
+	// If the user already has an existing RG in a different region, we must not
+	// overwrite it — ARM cannot change the location of an existing resource group.
+	currentLocation, _ := getEnvValue(ctx, azdClient, envName, "AZURE_LOCATION")
+	if currentLocation == "" {
+		if err := setEnvValue(ctx, azdClient, envName, "AZURE_LOCATION", selectedProject.Location); err != nil {
+			return nil, fmt.Errorf("failed to set AZURE_LOCATION: %w", err)
+		}
 	}
 
 	// Configure all Foundry project environment variables
-	if err := configureFoundryProjectEnv(ctx, azdClient, credential, envName, selectedProject, subscriptionId, skipACR); err != nil {
+	if err := configureFoundryProjectEnv(
+		ctx, azdClient, credential, envName, selectedProject, subscriptionId, skipACR, bicepless,
+	); err != nil {
 		return nil, fmt.Errorf("failed to configure Foundry project environment: %w", err)
 	}
 

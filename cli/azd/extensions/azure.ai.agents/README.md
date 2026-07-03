@@ -1,5 +1,61 @@
 # Azure Developer CLI (azd) Agents Extension
 
+## Running Local Agents
+
+`azd ai agent run` starts the selected agent locally and, by default, opens the
+Agent Inspector after the local agent port is accepting connections. The
+inspector launch is best-effort: if `azure.ai.inspector` is not installed or
+fails to start, the agent process keeps running and azd prints install guidance.
+
+Use `--no-inspector` to run only the local agent process:
+
+```bash
+azd ai agent run --no-inspector
+```
+
+## Migrating Legacy Agent Configuration
+
+New Foundry agent projects keep the agent definition directly on the
+`azure.ai.agent` service entry in `azure.yaml`. Older projects may still have the
+definition in an `agent.yaml` file or under the service's `config:` block. Those
+legacy shapes continue to work during the migration window, but azd prints a
+deprecation warning when it loads them.
+
+To migrate, re-run `azd ai agent init` from the project root and keep the
+generated `azure.yaml` service entry. After confirming `azd deploy` still works,
+remove the old `agent.yaml` or nested `config:` definition.
+
+Before:
+
+```yaml
+services:
+  my-agent:
+    host: azure.ai.agent
+    project: .
+    config:
+      kind: hosted
+      description: My hosted agent
+```
+
+After:
+
+```yaml
+services:
+  my-agent:
+    host: azure.ai.agent
+    project: .
+    kind: hosted
+    description: My hosted agent
+```
+
+## Private networking for `host: azure.ai.project`
+
+Foundry project services can be provisioned as network-secured, VNet-bound
+accounts by adding a `network:` block to the `host: azure.ai.project` service in
+`azure.yaml`. See [Private networking for `host: azure.ai.project`](docs/private-networking.md)
+for the schema reference, BYO-image requirements, and VNet deployment
+cheatsheet.
+
 ## Local Development
 
 ### Prerequisites

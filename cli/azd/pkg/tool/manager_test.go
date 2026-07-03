@@ -6,6 +6,7 @@ package tool
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,19 +21,28 @@ type mockInstaller struct {
 	installFn func(
 		ctx context.Context,
 		tool *ToolDefinition,
+		opts ...InstallOption,
 	) (*InstallResult, error)
 	upgradeFn func(
 		ctx context.Context,
 		tool *ToolDefinition,
+		opts ...InstallOption,
 	) (*InstallResult, error)
+	uninstallFn func(
+		ctx context.Context,
+		tool *ToolDefinition,
+		opts ...InstallOption,
+	) (*InstallResult, error)
+	availableSkillHostsFn func(ctx context.Context, tool *ToolDefinition) []string
 }
 
 func (m *mockInstaller) Install(
 	ctx context.Context,
 	tool *ToolDefinition,
+	opts ...InstallOption,
 ) (*InstallResult, error) {
 	if m.installFn != nil {
-		return m.installFn(ctx, tool)
+		return m.installFn(ctx, tool, opts...)
 	}
 	return &InstallResult{
 		Tool:    tool,
@@ -43,9 +53,31 @@ func (m *mockInstaller) Install(
 func (m *mockInstaller) Upgrade(
 	ctx context.Context,
 	tool *ToolDefinition,
+	opts ...InstallOption,
 ) (*InstallResult, error) {
 	if m.upgradeFn != nil {
-		return m.upgradeFn(ctx, tool)
+		return m.upgradeFn(ctx, tool, opts...)
+	}
+	return &InstallResult{
+		Tool:    tool,
+		Success: true,
+	}, nil
+}
+
+func (m *mockInstaller) AvailableSkillHosts(ctx context.Context, tool *ToolDefinition) []string {
+	if m.availableSkillHostsFn != nil {
+		return m.availableSkillHostsFn(ctx, tool)
+	}
+	return nil
+}
+
+func (m *mockInstaller) Uninstall(
+	ctx context.Context,
+	tool *ToolDefinition,
+	opts ...InstallOption,
+) (*InstallResult, error) {
+	if m.uninstallFn != nil {
+		return m.uninstallFn(ctx, tool, opts...)
 	}
 	return &InstallResult{
 		Tool:    tool,
@@ -207,6 +239,7 @@ func TestManager_InstallTools(t *testing.T) {
 			installFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
 				installedIDs = append(installedIDs, tool.Id)
 				return &InstallResult{
@@ -256,6 +289,31 @@ func TestManager_InstallTools(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, results)
 	})
+}
+
+func TestManager_InstallToolsDependencyResolution(t *testing.T) {
+	t.Parallel()
+
+	// Two synthetic tools: "dependent" requires "base".
+	baseTool := func() *ToolDefinition {
+		return &ToolDefinition{Id: "base"}
+	}
+	dependentTool := func() *ToolDefinition {
+		return &ToolDefinition{
+			Id:           "dependent",
+			Dependencies: []string{"base"},
+		}
+	}
+
+	// newMgr builds a Manager whose manifest contains only the
+	// synthetic tools so the test is isolated from BuiltInTools().
+	newMgr := func(det Detector, inst Installer) *Manager {
+		return &Manager{
+			manifest:  []*ToolDefinition{baseTool(), dependentTool()},
+			detector:  det,
+			installer: inst,
+		}
+	}
 
 	t.Run("ResolvesUninstalledDependencies", func(t *testing.T) {
 		t.Parallel()
@@ -265,50 +323,33 @@ func TestManager_InstallTools(t *testing.T) {
 			installFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
 				installedIDs = append(installedIDs, tool.Id)
-				return &InstallResult{
-					Tool:    tool,
-					Success: true,
-				}, nil
+				return &InstallResult{Tool: tool, Success: true}, nil
 			},
 		}
 
+		// "base" is not installed, triggering dependency resolution.
 		det := &mockDetector{
 			detectToolFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
 			) (*ToolStatus, error) {
-				// az-cli is NOT installed yet, triggering
-				// dependency resolution.
-				if tool.Id == "az-cli" {
-					return &ToolStatus{
-						Tool:      tool,
-						Installed: false,
-					}, nil
-				}
 				return &ToolStatus{
 					Tool:      tool,
-					Installed: true,
+					Installed: tool.Id != "base",
 				}, nil
 			},
 		}
 
-		mgr := NewManager(det, inst, nil)
-
-		// azd-ai-extensions depends on az-cli.
-		results, err := mgr.InstallTools(
-			t.Context(),
-			[]string{"azd-ai-extensions"},
-		)
+		mgr := newMgr(det, inst)
+		results, err := mgr.InstallTools(t.Context(), []string{"dependent"})
 
 		require.NoError(t, err)
-		require.Len(t, results, 2,
-			"should install dep + requested tool")
-
-		// az-cli should be first (dependency).
-		assert.Equal(t, "az-cli", installedIDs[0])
-		assert.Equal(t, "azd-ai-extensions", installedIDs[1])
+		require.Len(t, results, 2, "should install dep + requested tool")
+		assert.Equal(t, []string{"base", "dependent"}, installedIDs,
+			"dependency must be installed first")
 	})
 
 	t.Run("SkipsDependencyAlreadyInstalled", func(t *testing.T) {
@@ -319,38 +360,29 @@ func TestManager_InstallTools(t *testing.T) {
 			installFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
 				installedIDs = append(installedIDs, tool.Id)
-				return &InstallResult{
-					Tool:    tool,
-					Success: true,
-				}, nil
+				return &InstallResult{Tool: tool, Success: true}, nil
 			},
 		}
 
+		// Everything already installed; dependency must be skipped.
 		det := &mockDetector{
 			detectToolFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
 			) (*ToolStatus, error) {
-				// az IS already installed.
-				return &ToolStatus{
-					Tool:      tool,
-					Installed: true,
-				}, nil
+				return &ToolStatus{Tool: tool, Installed: true}, nil
 			},
 		}
 
-		mgr := NewManager(det, inst, nil)
-		results, err := mgr.InstallTools(
-			t.Context(),
-			[]string{"azd-ai-extensions"},
-		)
+		mgr := newMgr(det, inst)
+		results, err := mgr.InstallTools(t.Context(), []string{"dependent"})
 
 		require.NoError(t, err)
-		// Only 1 result: the requested tool (dep skipped).
-		require.Len(t, results, 1)
-		assert.Equal(t, "azd-ai-extensions", results[0].Tool.Id)
+		require.Len(t, results, 1, "dep should be skipped")
+		assert.Equal(t, "dependent", results[0].Tool.Id)
 	})
 
 	t.Run("FailedDependencySkipsDependent", func(t *testing.T) {
@@ -360,18 +392,16 @@ func TestManager_InstallTools(t *testing.T) {
 			installFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
-				if tool.Id == "az-cli" {
+				if tool.Id == "base" {
 					return &InstallResult{
 						Tool:    tool,
 						Success: false,
 						Error:   errors.New("install failed"),
 					}, nil
 				}
-				return &InstallResult{
-					Tool:    tool,
-					Success: true,
-				}, nil
+				return &InstallResult{Tool: tool, Success: true}, nil
 			},
 		}
 
@@ -380,35 +410,66 @@ func TestManager_InstallTools(t *testing.T) {
 				_ context.Context,
 				tool *ToolDefinition,
 			) (*ToolStatus, error) {
-				// az-cli not installed => triggers dep install.
-				if tool.Id == "az-cli" {
-					return &ToolStatus{
-						Tool:      tool,
-						Installed: false,
-					}, nil
-				}
 				return &ToolStatus{
 					Tool:      tool,
-					Installed: true,
+					Installed: tool.Id != "base",
 				}, nil
 			},
 		}
 
-		mgr := NewManager(det, inst, nil)
-		results, err := mgr.InstallTools(
-			t.Context(),
-			[]string{"azd-ai-extensions"},
-		)
+		mgr := newMgr(det, inst)
+		results, err := mgr.InstallTools(t.Context(), []string{"dependent"})
 
 		require.NoError(t, err)
 		require.Len(t, results, 2)
-
-		// Both should have errors: dep failed, dependent skipped.
+		// Dep result records the install failure; dependent is skipped.
 		assert.Error(t, results[0].Error)
 		assert.Error(t, results[1].Error)
-		assert.Contains(t, results[1].Error.Error(),
-			"dependency failed")
+		assert.Contains(t, results[1].Error.Error(), "dependency")
 	})
+}
+
+// TestManifest_SkillsListedAfterHostCLIs verifies the ordering invariant
+// the install flow relies on: every skill tool appears AFTER any agent
+// host CLI it could install through (e.g. github-copilot-cli) in the
+// built-in manifest. Batch installs (--all, interactive picker) derive
+// their order from the manifest, so this ordering is what guarantees the
+// host CLI is installed before the skill — no runtime re-sorting needed.
+func TestManifest_SkillsListedAfterHostCLIs(t *testing.T) {
+	t.Parallel()
+
+	tools := BuiltInTools()
+	indexOf := func(id string) int {
+		return slices.IndexFunc(tools, func(td *ToolDefinition) bool {
+			return td.Id == id
+		})
+	}
+
+	// Maps a host binary name to the manifest tool id that provides it.
+	hostToolID := map[string]string{
+		"copilot": "github-copilot-cli",
+	}
+
+	for _, td := range tools {
+		if td.Category != ToolCategorySkill {
+			continue
+		}
+		skillIdx := indexOf(td.Id)
+		for _, host := range td.SkillHosts {
+			cliID, ok := hostToolID[host.Host]
+			if !ok {
+				continue // host has no installable CLI in the manifest
+			}
+			cliIdx := indexOf(cliID)
+			if cliIdx < 0 {
+				continue
+			}
+			assert.Greater(t, skillIdx, cliIdx,
+				"skill %q must be listed after its host CLI %q in the "+
+					"manifest so batch installs install the host CLI first",
+				td.Id, cliID)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +487,7 @@ func TestManager_UpgradeTools(t *testing.T) {
 			upgradeFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
 				upgradedIDs = append(upgradedIDs, tool.Id)
 				return &InstallResult{
@@ -458,6 +520,149 @@ func TestManager_UpgradeTools(t *testing.T) {
 		)
 
 		results, err := mgr.UpgradeTools(
+			t.Context(),
+			[]string{"nonexistent"},
+		)
+
+		require.Error(t, err)
+		assert.Nil(t, results)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// UninstallTools
+// ---------------------------------------------------------------------------
+
+func TestManager_UninstallTools(t *testing.T) {
+	t.Parallel()
+
+	t.Run("DelegatesToInstaller", func(t *testing.T) {
+		t.Parallel()
+
+		var uninstalledIDs []string
+		inst := &mockInstaller{
+			uninstallFn: func(
+				_ context.Context,
+				tool *ToolDefinition,
+				_ ...InstallOption,
+			) (*InstallResult, error) {
+				uninstalledIDs = append(uninstalledIDs, tool.Id)
+				return &InstallResult{
+					Tool:    tool,
+					Success: true,
+				}, nil
+			},
+		}
+
+		mgr := NewManager(
+			&mockDetector{}, inst, nil,
+		)
+
+		results, err := mgr.UninstallTools(
+			t.Context(),
+			[]string{"az-cli", "github-copilot-cli"},
+		)
+
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+		assert.Contains(t, uninstalledIDs, "az-cli")
+		assert.Contains(t, uninstalledIDs, "github-copilot-cli")
+	})
+
+	t.Run("ForwardsInstallOptions", func(t *testing.T) {
+		t.Parallel()
+
+		var gotOpts int
+		inst := &mockInstaller{
+			uninstallFn: func(
+				_ context.Context,
+				tool *ToolDefinition,
+				opts ...InstallOption,
+			) (*InstallResult, error) {
+				gotOpts = len(opts)
+				return &InstallResult{Tool: tool, Success: true}, nil
+			},
+		}
+
+		mgr := NewManager(&mockDetector{}, inst, nil)
+
+		_, err := mgr.UninstallTools(
+			t.Context(),
+			[]string{"az-cli"},
+			WithHosts("copilot"),
+		)
+
+		require.NoError(t, err)
+		assert.Equal(t, 1, gotOpts, "install options must be forwarded to the installer")
+	})
+
+	t.Run("RecordsFailureWithoutAbortingBatch", func(t *testing.T) {
+		t.Parallel()
+
+		inst := &mockInstaller{
+			uninstallFn: func(
+				_ context.Context,
+				tool *ToolDefinition,
+				_ ...InstallOption,
+			) (*InstallResult, error) {
+				if tool.Id == "az-cli" {
+					return nil, errors.New("boom")
+				}
+				return &InstallResult{Tool: tool, Success: true}, nil
+			},
+		}
+
+		mgr := NewManager(&mockDetector{}, inst, nil)
+
+		results, err := mgr.UninstallTools(
+			t.Context(),
+			[]string{"az-cli", "github-copilot-cli"},
+		)
+
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+		assert.Error(t, results[0].Error)
+		assert.True(t, results[1].Success)
+	})
+
+	t.Run("UninstallsSkillsBeforeHostCLIs", func(t *testing.T) {
+		t.Parallel()
+
+		var order []string
+		inst := &mockInstaller{
+			uninstallFn: func(
+				_ context.Context,
+				tool *ToolDefinition,
+				_ ...InstallOption,
+			) (*InstallResult, error) {
+				order = append(order, tool.Id)
+				return &InstallResult{Tool: tool, Success: true}, nil
+			},
+		}
+
+		mgr := NewManager(&mockDetector{}, inst, nil)
+
+		// IDs supplied in manifest order (host CLI before skill), which is
+		// what `--all` and the interactive picker produce. The skill must
+		// still be uninstalled first so its host CLI is on PATH to remove
+		// it; otherwise removing the host first would orphan the skill.
+		_, err := mgr.UninstallTools(
+			t.Context(),
+			[]string{"github-copilot-cli", "azure-skills"},
+		)
+
+		require.NoError(t, err)
+		require.Equal(t, []string{"azure-skills", "github-copilot-cli"}, order)
+	})
+
+	t.Run("UnknownIDReturnsError", func(t *testing.T) {
+		t.Parallel()
+
+		mgr := NewManager(
+			&mockDetector{}, &mockInstaller{}, nil,
+		)
+
+		results, err := mgr.UninstallTools(
 			t.Context(),
 			[]string{"nonexistent"},
 		)
@@ -558,6 +763,7 @@ func TestManager_UpgradeAll(t *testing.T) {
 			upgradeFn: func(
 				_ context.Context,
 				tool *ToolDefinition,
+				_ ...InstallOption,
 			) (*InstallResult, error) {
 				upgradedIDs = append(upgradedIDs, tool.Id)
 				return &InstallResult{
@@ -590,4 +796,23 @@ func TestManager_UpgradeAll(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, results, 1, "only installed tools upgraded")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// AvailableSkillHosts
+// ---------------------------------------------------------------------------
+
+func TestManager_AvailableSkillHosts(t *testing.T) {
+	installer := &mockInstaller{
+		availableSkillHostsFn: func(_ context.Context, _ *ToolDefinition) []string {
+			return []string{"copilot", "claude"}
+		},
+	}
+	m := NewManager(&mockDetector{}, installer, nil)
+
+	got := m.AvailableSkillHosts(t.Context(), &ToolDefinition{
+		Id:       "azure-skills",
+		Category: ToolCategorySkill,
+	})
+	assert.Equal(t, []string{"copilot", "claude"}, got)
 }

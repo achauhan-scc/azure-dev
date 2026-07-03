@@ -84,6 +84,15 @@ azd extension source add -n dev -t url -l "https://aka.ms/azd/extensions/registr
 
 Extensions installed from the dev registry are automatically promoted to the main registry when a newer version becomes available there. See the [Dev/Experimental Extension Registry](./extension-resolution-and-versioning.md#devexperimental-extension-registry) section for full details on stability expectations, submission guidelines, promotion behavior, and troubleshooting.
 
+A separate **nightly** registry distributes always-latest, automatically built snapshots of first-party extensions (signed on Windows/macOS, built from `main`). To opt in:
+
+```bash
+# Add a new extension source name 'nightly' to your `azd` configuration.
+azd extension source add -n nightly -t url -l "https://raw.githubusercontent.com/Azure/azure-dev/nightly/cli/azd/extensions/registry.nightly.json"
+```
+
+See the [Nightly Extension Registry](./extension-resolution-and-versioning.md#nightly-extension-registry) section for version semantics, promotion behavior, and caveats.
+
 #### `azd extension source list`
 
 Displays a list of installed extension sources.
@@ -109,21 +118,29 @@ Extensions are a collection of executable artifacts that extend or enhance funct
 Lists matching extensions from one or more extension sources.
 
 - `--installed` When set displays a list of installed extensions.
-- `--source` When set will only list extensions from the specified source.
+- `-s, --source` Filters by registered source name or registry location (URL or file path). Locations are queried read-only and are not registered. Extensions from an unregistered location show the location itself in the `SOURCE` column.
 - `--tags` Allows filtering extensions by tags (e.g., AI, test)
 
 #### `azd extension show <extension-id> [flags]`
 
 Shows detailed information for a specific extension, including description, tags, versions, and installation status.
 
-- `-s, --source` The extension source to use. Use this flag when the same extension ID exists in multiple sources.
+- `-s, --source` Uses a registered source name or registry location (URL or file path). Locations are queried read-only and are not registered.
 
 #### `azd extension install <extension-ids> [flags]`
 
 Installs one or more extensions from any configured extension source.
 
-- `-v, --version` Specifies the version constraint to apply when installing extensions. Supports any semver constraint notation.
-- `-s, --source` Specifies the extension source used for installations.
+- `-v, --version` Specifies the exact version to install.
+- `-s, --source` Specifies the extension source used for installations. In addition to registered source names, this accepts a registry location (URL or file path). `azd` registers the location as a source, prompting for a name and confirming first for URLs, then installs from it:
+
+  ```bash
+  azd extension install <id> -s https://link/to/registry.json
+  ```
+
+  If the same location is already registered, `azd` reuses that source. File paths are stored as absolute paths.
+
+  Under `--no-prompt`, registering a source from a location is not allowed; add the source first with `azd extension source add`.
 
 #### `azd extension uninstall <extension-ids> [flags]`
 
@@ -136,8 +153,9 @@ Uninstalls one or more previously installed extensions.
 Upgrades one or more extensions to the latest versions.
 
 - `--all` Upgrades all previously installed extensions when specified.
-- `-v, --version` Upgrades a specified extension using a semver version constraint, if provided.
-- `-s, --source` Specifies the extension source used for installations.
+- `-v, --version` Upgrades a specified extension to an exact version, if provided.
+- `-s, --source` Specifies the source used for the upgrade. In addition to registered source names, this accepts a registry location (URL or file path). `azd` registers the location as a source before resolving the extension, updates the extension's stored source after a successful upgrade, and rejects locations under `--no-prompt`; add the source first with `azd extension source add`.
+- `--no-dependency-upgrades` Skips upgrading dependencies declared by extension packs.
 
 ## Developing Extensions
 
@@ -641,7 +659,7 @@ Usage: `azd x init`
 
 Usage: `azd x build`
 
-- `--cwd` - The extension directory, defaults to `.`.
+- `-C, --cwd` - The extension directory, inherited from azd's global flag (defaults to the current directory).
 - `--all` - Builds binaries for all supported operating systems and architecture.
 - `--output, -o` - Path to the output directory, defaults to `./bin`.
 - `--skip-install` - When skips local installation after successful build.
@@ -652,7 +670,7 @@ Usage: `azd x build`
 
 Usage: `azd x watch`
 
-- `--cwd` - The extension directory, defaults to `.`.
+- `-C, --cwd` - The extension directory, inherited from azd's global flag (defaults to the current directory).
 
 ---
 
@@ -660,7 +678,7 @@ Usage: `azd x watch`
 
 Usage: `azd x pack`
 
-- `--cwd` - The extension directory, defaults to `.`.
+- `-C, --cwd` - The extension directory, inherited from azd's global flag (defaults to the current directory).
 - `--input, -i` - Path to the input directory that contains binary files.
 - `--output, -o` - Path to the artifacts output directory, defaults to local `azd` artifacts path, `~/.azd/registry`.
 - `--rebuild` - When set forces a rebuild before packaging.
@@ -671,7 +689,7 @@ Usage: `azd x pack`
 
 Usage: `azd x release --repo {owner}/{name}`
 
-- `--cwd` - The extension directory, defaults to `.`.
+- `-C, --cwd` - The extension directory, inherited from azd's global flag (defaults to the current directory).
 - `--artifacts` - Path to the artifacts to upload for the release, defaults to local `azd` artifacts path, `~/.azd/registry`.
 - `--repo` - The Github repo name in `{owner}/{repo}` format.
 - `--title, -t` - The name of the release, defaults to extension name plus version.
@@ -687,7 +705,7 @@ Usage: `azd x release --repo {owner}/{name}`
 
 Usage: `azd x publish --repo {owner}/{name}`
 
-- `--cwd` - The extension directory, defaults to `.`.
+- `-C, --cwd` - The extension directory, inherited from azd's global flag (defaults to the current directory).
 - `--registry, -r` - The path to the registry.json file to update, defaults to local extension registry
 - `--repo` - The Github repo name in `{owner}/{repo}` format.
 - `--version, -v` - The version of the release, defaults to extension version from extension manifest
@@ -921,6 +939,36 @@ Extensions can provide AI agent tools through the Model Context Protocol, enabli
 - Azure service automation for AI agents
 - Custom development workflows for AI-assisted development
 
+##### Validation Provider (`validation-provider`)
+
+> Extensions must declare the `validation-provider` capability in their `extension.yaml` file.
+
+Extensions can contribute validation checks to azd's validation pipeline. Currently
+supported check types:
+
+- **`local-preflight`** — Checks run during `azd provision` before deployment. The
+  extension receives the Bicep snapshot, ARM template, ARM parameters, and Azure
+  location as context.
+
+Future check types (e.g., `project-config`, `auth`) can be added without protocol
+changes.
+
+**Example:**
+
+```go
+host := azdext.NewExtensionHost(azdClient).
+    WithValidationCheck(azdext.ValidationCheckRegistration{
+        CheckType: "local-preflight",
+        RuleID:    "my_naming_rule",
+        Factory: func() azdext.ValidationCheckProvider {
+            return &MyNamingCheck{}
+        },
+    })
+```
+
+See [`local-preflight-validation.md`](../design/local-preflight-validation.md#extension-provided-checks)
+for full details on the check interface and context keys.
+
 #### Future Considerations
 
 Future ideas include:
@@ -1001,13 +1049,16 @@ A [JSON schema](../../extensions/extension.schema.json) is available to support 
 **Required Properties:**
 - `id`: Unique identifier for the extension
 - `version`: Semantic version following MAJOR.MINOR.PATCH format
-- `capabilities`: Array of extension capabilities (see below)
 - `displayName`: Human-readable name of the extension
 - `description`: Detailed description of the extension
+
+Each manifest must include either `capabilities` or `dependencies`. Extension packs may omit `capabilities`
+when they declare `dependencies` instead and have no executable.
 
 **Optional Properties:**
 - `namespace`: Command namespace for grouping extension commands
 - `entryPoint`: Executable or script that serves as the entry point
+- `capabilities`: Array of extension capabilities (see below)
 - `usage`: Instructions on how to use the extension
 - `examples`: Array of usage examples with name, description, and usage
 - `tags`: Keywords for categorization and filtering
@@ -1026,6 +1077,8 @@ Extensions can declare the following capabilities in their manifest:
 - **`mcp-server`**: Provide Model Context Protocol tools for AI agents
 - **`service-target-provider`**: Provide custom service deployment targets
 - **`framework-service-provider`**: Provide custom language frameworks and build systems
+- **`provisioning-provider`**: Provide a custom infrastructure provisioning experience (alternative to Bicep / Terraform)
+- **`validation-provider`**: Contribute validation checks to azd's preflight and future validation pipelines
 - **`metadata`**: Provide comprehensive metadata about commands and configuration schemas
 
 #### Complete Extension Manifest Example
@@ -1046,6 +1099,7 @@ capabilities:
   - lifecycle-events
   - service-target-provider
   - framework-service-provider
+  - validation-provider
   - mcp-server
   - metadata
 
@@ -1107,6 +1161,33 @@ Dependencies support semantic versioning constraints:
 - `^1.0.0`: Compatible with version 1.x.x
 - `~1.2.0`: Compatible with version 1.2.x
 - `>=1.0.0 <2.0.0`: Range specification
+
+azd installs or upgrades to the highest published version that satisfies the dependency constraint.
+Pre-release versions follow standard semver constraint rules: a constraint must include a pre-release comparator to match pre-release versions.
+For example, `>=0.1.0` does not match `0.1.31-preview`; use `>=0.1.0-0` or a pre-release range such as `~0.1.0-preview` when preview versions should be eligible.
+
+#### Extension Packs
+
+An extension pack is an extension manifest that groups related extensions so users can install them with one command. Packs declare `dependencies` but do not provide an executable, command namespace, or runtime capabilities of their own. Use a pack when you want to publish a curated set of extensions, such as a product family or scenario bundle, without asking users to install each extension separately.
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/refs/heads/main/cli/azd/extensions/extension.schema.json
+
+id: contoso.ai
+displayName: Contoso AI Extension Pack
+description: Installs the Contoso AI azd extensions.
+version: 0.1.0
+
+dependencies:
+  - id: contoso.ai.agents
+    version: "~0.1.0-preview"
+  - id: contoso.ai.models
+    version: "~0.1.0-preview"
+```
+
+Pack manifests must include at least one dependency. They may omit `capabilities`, `namespace`, `entryPoint`, `usage`, and `examples` when the pack has no commands of its own. Installing a pack installs its dependencies recursively from the same extension source as the pack. Dependency versions in the manifest support semver constraints, but command-line `--version` values for `azd extension install` and `azd extension upgrade` are exact versions.
+
+Upgrading a pack upgrades the pack and, by default, reconciles installed dependencies to the highest published versions that satisfy the pack's declared dependency constraints. This dependency reconciliation still runs when the pack itself is already current, because an unchanged pack can point to a dependency range with newer matching versions. Users can disable automatic dependency upgrades with `azd extension upgrade <pack-id> --no-dependency-upgrades`.
 
 #### Provider Registration
 

@@ -100,6 +100,16 @@ func TestSanitizeAgentName(t *testing.T) {
 			input:    "---",
 			expected: "my-agent",
 		},
+		{
+			name:     "non-ASCII characters stripped",
+			input:    "Ünö Ägent",
+			expected: "n-gent",
+		},
+		{
+			name:     "all non-ASCII falls back to default",
+			input:    "日本語エージェント",
+			expected: "my-agent",
+		},
 	}
 
 	for _, tt := range tests {
@@ -107,6 +117,9 @@ func TestSanitizeAgentName(t *testing.T) {
 			result := sanitizeAgentName(tt.input)
 			if result != tt.expected {
 				t.Errorf("sanitizeAgentName(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+			if err := agent_yaml.ValidateAgentName(result); err != nil {
+				t.Errorf("sanitizeAgentName(%q) produced invalid agent name %q: %v", tt.input, result, err)
 			}
 		})
 	}
@@ -397,117 +410,97 @@ func TestExtractResourceGroup(t *testing.T) {
 	}
 }
 
-func TestWriteDefinitionToSrcDir(t *testing.T) {
+func TestWriteAgentIgnoreToSrcDir(t *testing.T) {
 	t.Parallel()
 
-	t.Run("writes agent.yaml to directory", func(t *testing.T) {
+	t.Run("writes .agentignore and not agent.yaml", func(t *testing.T) {
 		t.Parallel()
 
-		dir := t.TempDir()
-		srcDir := filepath.Join(dir, "src")
-
-		definition := &agent_yaml.ContainerAgent{
-			AgentDefinition: agent_yaml.AgentDefinition{
-				Name: "test-agent",
-				Kind: agent_yaml.AgentKindHosted,
-			},
-			Protocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
-			},
-			EnvironmentVariables: &[]agent_yaml.EnvironmentVariable{
-				{Name: "AZURE_AI_MODEL_DEPLOYMENT_NAME", Value: "${AZURE_AI_MODEL_DEPLOYMENT_NAME}"},
-			},
-		}
+		srcDir := filepath.Join(t.TempDir(), "src")
 
 		action := &InitFromCodeAction{}
-		resultPath, err := action.writeDefinitionToSrcDir(definition, srcDir)
-		if err != nil {
+		if err := action.writeAgentIgnoreToSrcDir(srcDir); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		expectedPath := filepath.Join(srcDir, "agent.yaml")
-		if resultPath != expectedPath {
-			t.Errorf("path = %q, want %q", resultPath, expectedPath)
+		if _, err := os.Stat(filepath.Join(srcDir, ".agentignore")); err != nil {
+			t.Fatalf("expected .agentignore to exist: %v", err)
 		}
-
-		//nolint:gosec // test fixture path is created within test temp directory
-		content, err := os.ReadFile(resultPath)
-		if err != nil {
-			t.Fatalf("failed to read written file: %v", err)
-		}
-
-		contentStr := string(content)
-		// Verify key content is present in the YAML
-		if !containsAll(contentStr, "name: test-agent", "kind: hosted", "responses", "AZURE_AI_MODEL_DEPLOYMENT_NAME") {
-			t.Errorf("written content missing expected fields:\n%s", contentStr)
-		}
-		// AZURE_OPENAI_ENDPOINT and AZURE_AI_PROJECT_ENDPOINT should NOT be written to agent.yaml.
-		// Hosted agents receive platform-provided FOUNDRY_* variables such as FOUNDRY_PROJECT_ENDPOINT instead.
-		if strings.Contains(contentStr, "AZURE_OPENAI_ENDPOINT") || strings.Contains(contentStr, "AZURE_AI_PROJECT_ENDPOINT") {
-			t.Errorf("agent.yaml should not contain AZURE_OPENAI_ENDPOINT or AZURE_AI_PROJECT_ENDPOINT:\n%s", contentStr)
+		// The agent definition now lives in azure.yaml; no agent.yaml on disk.
+		if _, err := os.Stat(filepath.Join(srcDir, "agent.yaml")); !os.IsNotExist(err) {
+			t.Fatalf("agent.yaml should not be written; stat err = %v", err)
 		}
 	})
 
 	t.Run("creates nested directories", func(t *testing.T) {
 		t.Parallel()
 
-		dir := t.TempDir()
-		srcDir := filepath.Join(dir, "deep", "nested", "path")
-
-		definition := &agent_yaml.ContainerAgent{
-			AgentDefinition: agent_yaml.AgentDefinition{
-				Name: "nested-agent",
-				Kind: agent_yaml.AgentKindHosted,
-			},
-		}
-
+		srcDir := filepath.Join(t.TempDir(), "deep", "nested", "path")
 		action := &InitFromCodeAction{}
-		_, err := action.writeDefinitionToSrcDir(definition, srcDir)
-		if err != nil {
+		if err := action.writeAgentIgnoreToSrcDir(srcDir); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-
-		if _, err := os.Stat(filepath.Join(srcDir, "agent.yaml")); err != nil {
-			t.Fatalf("expected file to exist: %v", err)
+		if _, err := os.Stat(filepath.Join(srcDir, ".agentignore")); err != nil {
+			t.Fatalf("expected .agentignore to exist: %v", err)
 		}
 	})
+}
 
-	t.Run("overwrites existing file", func(t *testing.T) {
-		t.Parallel()
+func TestCreateDefinitionFromLocalAgent_NoPromptMissingAzureContextDefers(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
 
-		dir := t.TempDir()
-		existingFile := filepath.Join(dir, "agent.yaml")
-		//nolint:gosec // test fixture file permissions are intentional
-		if err := os.WriteFile(existingFile, []byte("old content"), 0644); err != nil {
-			t.Fatalf("write existing file: %v", err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print('hello')\n"), 0600); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
 
-		definition := &agent_yaml.ContainerAgent{
-			AgentDefinition: agent_yaml.AgentDefinition{
-				Name: "new-agent",
-				Kind: agent_yaml.AgentKindHosted,
-			},
-		}
+	const envName = "agent-dev"
+	envServer := &testEnvironmentServiceServer{
+		values: map[string]map[string]string{envName: {}},
+	}
+	azdClient := newTestAzdClient(t, envServer, &testWorkflowServiceServer{})
+	action := &InitFromCodeAction{
+		azdClient:    azdClient,
+		environment:  &azdext.Environment{Name: envName},
+		azureContext: nil,
+		flags: &initFlags{
+			noPrompt: true,
+			env:      envName,
+			model:    "gpt-4o",
+		},
+	}
 
-		action := &InitFromCodeAction{}
-		_, err := action.writeDefinitionToSrcDir(definition, dir)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		//nolint:gosec // test fixture path is created within test temp directory
-		content, err := os.ReadFile(existingFile)
-		if err != nil {
-			t.Fatalf("failed to read file: %v", err)
-		}
-
-		if string(content) == "old content" {
-			t.Error("expected file to be overwritten, but old content remains")
-		}
-		if !containsAll(string(content), "name: new-agent") {
-			t.Errorf("written content missing expected fields:\n%s", string(content))
-		}
+	var definition *agent_yaml.ContainerAgent
+	output, err := captureStdout(t, func() error {
+		var runErr error
+		definition, runErr = action.createDefinitionFromLocalAgent(t.Context())
+		return runErr
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if definition == nil {
+		t.Fatal("expected definition")
+	}
+	if envServer.values[envName]["USE_EXISTING_AI_PROJECT"] != "false" {
+		t.Fatalf("USE_EXISTING_AI_PROJECT = %q, want false", envServer.values[envName]["USE_EXISTING_AI_PROJECT"])
+	}
+	if got := envServer.values[envName][pendingProvisionEnvVar]; got != pendingReasonProject {
+		t.Fatalf("%s = %q, want %q", pendingProvisionEnvVar, got, pendingReasonProject)
+	}
+	if len(action.deploymentDetails) != 0 {
+		t.Fatalf("deploymentDetails length = %d, want 0", len(action.deploymentDetails))
+	}
+	if !strings.Contains(output, "Model configuration was deferred") {
+		t.Fatalf("output missing deferred model warning:\n%s", output)
+	}
+	if definition.EnvironmentVariables != nil {
+		for _, envVar := range *definition.EnvironmentVariables {
+			if envVar.Name == "AZURE_AI_MODEL_DEPLOYMENT_NAME" {
+				t.Fatalf("deferred model configuration should not add %s", envVar.Name)
+			}
+		}
+	}
 }
 
 func TestFoundryDeploymentInfo(t *testing.T) {
@@ -580,16 +573,6 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-// containsAll checks that s contains all the given substrings.
-func containsAll(s string, substrings ...string) bool {
-	for _, sub := range substrings {
-		if !strings.Contains(s, sub) {
-			return false
-		}
-	}
-	return true
-}
-
 func TestPromptProtocols_FlagValues(t *testing.T) {
 	t.Parallel()
 
@@ -604,7 +587,7 @@ func TestPromptProtocols_FlagValues(t *testing.T) {
 			name:          "responses only",
 			flagProtocols: []string{"responses"},
 			wantProtocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
+				{Protocol: "responses", Version: "2.0.0"},
 			},
 		},
 		{
@@ -618,7 +601,7 @@ func TestPromptProtocols_FlagValues(t *testing.T) {
 			name:          "both protocols",
 			flagProtocols: []string{"responses", "invocations"},
 			wantProtocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
+				{Protocol: "responses", Version: "2.0.0"},
 				{Protocol: "invocations", Version: "1.0.0"},
 			},
 		},
@@ -632,7 +615,7 @@ func TestPromptProtocols_FlagValues(t *testing.T) {
 			name:          "duplicates are removed",
 			flagProtocols: []string{"responses", "responses", "invocations"},
 			wantProtocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
+				{Protocol: "responses", Version: "2.0.0"},
 				{Protocol: "invocations", Version: "1.0.0"},
 			},
 		},
@@ -683,8 +666,8 @@ func TestPromptProtocols_NoPromptDefault(t *testing.T) {
 	if got[0].Protocol != "responses" {
 		t.Errorf("protocol = %q, want %q", got[0].Protocol, "responses")
 	}
-	if got[0].Version != "1.0.0" {
-		t.Errorf("version = %q, want %q", got[0].Version, "1.0.0")
+	if got[0].Version != "2.0.0" {
+		t.Errorf("version = %q, want %q", got[0].Version, "2.0.0")
 	}
 }
 
@@ -739,7 +722,7 @@ func TestPromptProtocols_Interactive(t *testing.T) {
 				}, nil
 			},
 			wantProtocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
+				{Protocol: "responses", Version: "2.0.0"},
 				{Protocol: "invocations", Version: "1.0.0"},
 			},
 		},
@@ -754,7 +737,7 @@ func TestPromptProtocols_Interactive(t *testing.T) {
 				}, nil
 			},
 			wantProtocols: []agent_yaml.ProtocolVersionRecord{
-				{Protocol: "responses", Version: "1.0.0"},
+				{Protocol: "responses", Version: "2.0.0"},
 			},
 		},
 		{
@@ -813,6 +796,230 @@ func TestPromptProtocols_Interactive(t *testing.T) {
 					t.Errorf("version[%d] = %q, want %q",
 						i, got[i].Version, tt.wantProtocols[i].Version)
 				}
+			}
+		})
+	}
+}
+
+func TestPromptDeployMode_FlagOverride(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		noPrompt             bool
+		showCodeDeploy       bool
+		flag                 string
+		userProvidedManifest bool
+		want                 string
+		wantErr              bool
+		wantErrContain       string
+	}{
+		{
+			name:           "flag=container returns container",
+			noPrompt:       true,
+			showCodeDeploy: true,
+			flag:           "container",
+			want:           "container",
+		},
+		{
+			name:           "flag=code returns code",
+			noPrompt:       true,
+			showCodeDeploy: true,
+			flag:           "code",
+			want:           "code",
+		},
+		{
+			name:           "flag=code works even when showCodeDeploy=false",
+			noPrompt:       true,
+			showCodeDeploy: false,
+			flag:           "code",
+			want:           "code",
+		},
+		{
+			name:           "invalid flag value returns error",
+			noPrompt:       true,
+			showCodeDeploy: true,
+			flag:           "invalid",
+			wantErr:        true,
+			wantErrContain: "invalid --deploy-mode value",
+		},
+		{
+			name:           "no flag + noPrompt defaults to code",
+			noPrompt:       true,
+			showCodeDeploy: true,
+			flag:           "",
+			want:           "code",
+		},
+		{
+			name:           "no flag + showCodeDeploy=false defaults to container",
+			noPrompt:       false,
+			showCodeDeploy: false,
+			flag:           "",
+			want:           "container",
+		},
+		{
+			name:                 "userProvidedManifest + showCodeDeploy auto-selects code",
+			noPrompt:             false,
+			showCodeDeploy:       true,
+			flag:                 "",
+			userProvidedManifest: true,
+			want:                 "code",
+		},
+		{
+			name:                 "showCodeDeploy=false returns container regardless of userProvidedManifest",
+			noPrompt:             false,
+			showCodeDeploy:       false,
+			flag:                 "",
+			userProvidedManifest: true,
+			want:                 "container",
+		},
+		{
+			name:                 "explicit flag overrides userProvidedManifest",
+			noPrompt:             false,
+			showCodeDeploy:       true,
+			flag:                 "container",
+			userProvidedManifest: true,
+			want:                 "container",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := promptDeployMode(t.Context(), nil, tt.noPrompt, tt.showCodeDeploy, tt.flag, tt.userProvidedManifest)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tt.wantErrContain != "" && !strings.Contains(err.Error(), tt.wantErrContain) {
+					t.Errorf("error = %q, want containing %q", err.Error(), tt.wantErrContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("promptDeployMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPromptCodeConfig_FlagOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		files                []string // files to create in temp dir
+		noPrompt             bool
+		userProvidedManifest bool
+		opts                 codeDeployOptions
+		wantRuntime          string
+		wantEntry            string
+		wantDepRes           string
+	}{
+		{
+			name:        "all opts provided",
+			noPrompt:    true,
+			opts:        codeDeployOptions{runtime: "python_3_14", entryPoint: "bot.py", depResolution: "bundled"},
+			wantRuntime: "python_3_14",
+			wantEntry:   "bot.py",
+			wantDepRes:  "bundled",
+		},
+		{
+			name:        "noPrompt defaults for python project",
+			files:       []string{"requirements.txt", "app.py"},
+			noPrompt:    true,
+			opts:        codeDeployOptions{},
+			wantRuntime: "python_3_13",
+			wantEntry:   "app.py",
+			wantDepRes:  "remote_build",
+		},
+		{
+			name:        "noPrompt defaults for dotnet project",
+			files:       []string{"MyBot.csproj", "Program.cs"},
+			noPrompt:    true,
+			opts:        codeDeployOptions{},
+			wantRuntime: "dotnet_10",
+			wantEntry:   "MyBot.dll",
+			wantDepRes:  "remote_build",
+		},
+		{
+			name:        "opts override noPrompt defaults",
+			files:       []string{"requirements.txt", "app.py"},
+			noPrompt:    true,
+			opts:        codeDeployOptions{runtime: "python_3_14", entryPoint: "serve.py", depResolution: "bundled"},
+			wantRuntime: "python_3_14",
+			wantEntry:   "serve.py",
+			wantDepRes:  "bundled",
+		},
+		{
+			name:        "partial opts — runtime from flag, rest from defaults",
+			files:       []string{"app.py"},
+			noPrompt:    true,
+			opts:        codeDeployOptions{runtime: "python_3_14"},
+			wantRuntime: "python_3_14",
+			wantEntry:   "app.py",
+			wantDepRes:  "remote_build",
+		},
+		{
+			name:                 "userProvidedManifest auto-detects python defaults",
+			files:                []string{"requirements.txt", "app.py"},
+			noPrompt:             false,
+			userProvidedManifest: true,
+			opts:                 codeDeployOptions{},
+			wantRuntime:          "python_3_13",
+			wantEntry:            "app.py",
+			wantDepRes:           "remote_build",
+		},
+		{
+			name:                 "userProvidedManifest auto-detects dotnet defaults",
+			files:                []string{"MyAgent.csproj"},
+			noPrompt:             false,
+			userProvidedManifest: true,
+			opts:                 codeDeployOptions{},
+			wantRuntime:          "dotnet_10",
+			wantEntry:            "MyAgent.dll",
+			wantDepRes:           "remote_build",
+		},
+		{
+			name:                 "opts override userProvidedManifest defaults",
+			files:                []string{"requirements.txt", "app.py"},
+			noPrompt:             false,
+			userProvidedManifest: true,
+			opts:                 codeDeployOptions{runtime: "python_3_14", entryPoint: "bot.py", depResolution: "bundled"},
+			wantRuntime:          "python_3_14",
+			wantEntry:            "bot.py",
+			wantDepRes:           "bundled",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			for _, f := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, f), []byte(""), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := promptCodeConfig(t.Context(), nil, dir, tt.noPrompt, tt.opts, tt.userProvidedManifest)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Runtime != tt.wantRuntime {
+				t.Errorf("Runtime = %q, want %q", got.Runtime, tt.wantRuntime)
+			}
+			if got.EntryPoint != tt.wantEntry {
+				t.Errorf("EntryPoint = %q, want %q", got.EntryPoint, tt.wantEntry)
+			}
+			if got.DependencyResolution == nil {
+				t.Fatal("DependencyResolution is nil")
+			}
+			if *got.DependencyResolution != tt.wantDepRes {
+				t.Errorf("DependencyResolution = %q, want %q", *got.DependencyResolution, tt.wantDepRes)
 			}
 		})
 	}

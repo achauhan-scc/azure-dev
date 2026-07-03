@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"text/tabwriter"
 
+	"azureaiagent/internal/exterrors"
 	"azureaiagent/internal/pkg/agents/agent_api"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
@@ -20,6 +21,7 @@ import (
 
 // filesFlags holds the common flags shared by all file subcommands.
 type filesFlags struct {
+	userIdentityFlags
 	agentName string // optional: agent name (matches azure.yaml service name)
 	session   string // optional: explicit session ID override
 }
@@ -38,7 +40,10 @@ of a hosted agent. This is useful for debugging, seeding data, and agent setup.
 Agent details (name, endpoint) are automatically resolved from the
 azd environment. Use --agent-name to select a specific agent when the project
 has multiple azure.ai.agent services. The session ID is automatically resolved
-from the last invoke session, or can be overridden with --session-id.`,
+from the last invoke session, or can be overridden with --session-id.
+
+For agents configured with header-based isolation, pass --user-identity
+on each file operation.`,
 	}
 
 	cmd.AddCommand(newFilesUploadCommand(extCtx))
@@ -55,6 +60,7 @@ from the last invoke session, or can be overridden with --session-id.`,
 func addFilesFlags(cmd *cobra.Command, flags *filesFlags) {
 	cmd.Flags().StringVarP(&flags.agentName, "agent-name", "n", "", "Agent name (matches azure.yaml service name; auto-detected when only one exists)")
 	cmd.Flags().StringVarP(&flags.session, "session-id", "s", "", "Session ID override (defaults to last invoke session)")
+	addUserIdentityFlag(cmd, &flags.userIdentityFlags)
 }
 
 // filesContext holds the resolved agent context and session for file operations.
@@ -127,12 +133,32 @@ type FilesUploadAction struct {
 	sessionID string
 }
 
+// bindUploadPositionals maps the [agent] [file] positionals onto the upload
+// flags, mirroring `azd ai agent invoke [agent] [message]`. The first
+// positional is the agent name and the second is the file to upload. With a
+// single positional it is the agent name when a file is already supplied via
+// --file/-f, otherwise it is the file itself. agentName and file are the
+// current flag values; the resolved values are returned.
+func bindUploadPositionals(args []string, agentName, file string) (string, string) {
+	switch len(args) {
+	case 2:
+		return args[0], args[1]
+	case 1:
+		if file != "" {
+			return args[0], file
+		}
+		return agentName, args[0]
+	default:
+		return agentName, file
+	}
+}
+
 func newFilesUploadCommand(extCtx *azdext.ExtensionContext) *cobra.Command {
 	flags := &filesUploadFlags{}
 	extCtx = ensureExtensionContext(extCtx)
 
 	cmd := &cobra.Command{
-		Use:   "upload [file]",
+		Use:   "upload [agent] [file]",
 		Short: "Upload a file to a hosted agent session.",
 		Long: `Upload a file to a hosted agent session.
 
@@ -140,26 +166,40 @@ Reads a local file and uploads it to the specified remote path
 in the session's filesystem. If --target-path is not provided,
 the remote path defaults to the local filename.
 
+Positional arguments mirror 'azd ai agent invoke [agent] [message]'. With two
+arguments the first is the agent name and the second is the file to upload.
+With a single argument it is the agent name when --file/-f already supplies the
+file, otherwise it is the file itself. The agent is auto-detected from
+azure.yaml when not provided.
+
 Agent details are automatically resolved from the azd environment.`,
-		Example: `  # Upload a file (remote path defaults to filename)
+		Example: `  # Upload a file (agent auto-detected, remote path defaults to filename)
   azd ai agent files upload ./data/input.csv
+
+  # Upload a file to a specific agent
+  azd ai agent files upload my-agent ./data/input.csv
 
   # Upload to a specific remote path
   azd ai agent files upload ./input.csv --target-path /data/input.csv
 
-  # Upload with flags
+  # Upload using flags
   azd ai agent files upload --file ./input.csv --agent-name my-agent`,
-		Args: cobra.MaximumNArgs(1),
+		Args: cobra.RangeArgs(0, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := azdext.WithAccessToken(cmd.Context())
 
-			if len(args) > 0 && flags.file == "" {
-				flags.file = args[0]
-			}
+			// Mirror `azd ai agent invoke [agent] [message]`: the first
+			// positional is the agent name and the second is the file to
+			// upload. With a single positional, it is the agent name when
+			// --file/-f already supplies the file, otherwise it is the file.
+			flags.agentName, flags.file = bindUploadPositionals(args, flags.agentName, flags.file)
+
 			if flags.file == "" {
-				return fmt.Errorf(
-					"file path is required as a positional argument " +
-						"or via --file",
+				return exterrors.Validation(
+					exterrors.CodeInvalidPositionalArg,
+					"a file argument or --file is required",
+					"provide the file to upload as a positional argument "+
+						"(e.g. azd ai agent files upload [agent] <file>) or use --file/-f",
 				)
 			}
 
@@ -211,6 +251,7 @@ func (a *FilesUploadAction) Run(ctx context.Context) error {
 		remotePath,
 		DefaultAgentAPIVersion,
 		file,
+		a.flags.sessionRequestOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
@@ -306,6 +347,7 @@ func (a *FilesDownloadAction) Run(ctx context.Context) error {
 		a.sessionID,
 		a.flags.file,
 		DefaultAgentAPIVersion,
+		a.flags.sessionRequestOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
@@ -422,6 +464,7 @@ func (a *FilesListAction) Run(ctx context.Context) error {
 		a.sessionID,
 		a.remotePath,
 		DefaultAgentAPIVersion,
+		a.flags.sessionRequestOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to list files: %w", err)
@@ -553,6 +596,7 @@ func (a *FilesRemoveAction) Run(ctx context.Context) error {
 		a.remotePath,
 		a.flags.recursive,
 		DefaultAgentAPIVersion,
+		a.flags.sessionRequestOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to remove file: %w", err)
@@ -567,8 +611,9 @@ func (a *FilesRemoveAction) Run(ctx context.Context) error {
 // FilesMkdirAction handles creating a directory in a session.
 type FilesMkdirAction struct {
 	*AgentContext
-	sessionID  string
-	remotePath string
+	sessionID      string
+	remotePath     string
+	requestOptions *agent_api.SessionRequestOptions
 }
 
 func newFilesMkdirCommand(extCtx *azdext.ExtensionContext) *cobra.Command {
@@ -610,9 +655,10 @@ Agent details are automatically resolved from the azd environment.`,
 			}
 
 			action := &FilesMkdirAction{
-				AgentContext: fc.AgentContext,
-				sessionID:    fc.sessionID,
-				remotePath:   dirPath,
+				AgentContext:   fc.AgentContext,
+				sessionID:      fc.sessionID,
+				remotePath:     dirPath,
+				requestOptions: flags.sessionRequestOptions(),
 			}
 
 			return action.Run(ctx)
@@ -638,6 +684,7 @@ func (a *FilesMkdirAction) Run(ctx context.Context) error {
 		a.sessionID,
 		a.remotePath,
 		DefaultAgentAPIVersion,
+		a.requestOptions,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
@@ -727,6 +774,7 @@ func (a *FilesStatAction) Run(ctx context.Context) error {
 		a.sessionID,
 		a.remotePath,
 		DefaultAgentAPIVersion,
+		a.flags.sessionRequestOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to stat file: %w", err)

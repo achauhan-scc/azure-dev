@@ -17,6 +17,30 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestFoundryProjectInfo_Endpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		info *FoundryProjectInfo
+		want string
+	}{
+		{name: "nil", info: nil, want: ""},
+		{name: "missing account", info: &FoundryProjectInfo{ProjectName: "proj"}, want: ""},
+		{name: "missing project", info: &FoundryProjectInfo{AccountName: "acct"}, want: ""},
+		{
+			name: "complete",
+			info: &FoundryProjectInfo{AccountName: "acct", ProjectName: "proj"},
+			want: "https://acct.services.ai.azure.com/api/projects/proj",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, tc.info.Endpoint())
+		})
+	}
+}
+
 func TestExtractProjectDetails(t *testing.T) {
 	t.Parallel()
 
@@ -210,6 +234,18 @@ func (s *testEnvironmentServiceServer) GetValue(
 	return nil, status.Error(codes.NotFound, "key not found")
 }
 
+func (s *testEnvironmentServiceServer) GetValues(
+	_ context.Context, req *azdext.GetEnvironmentRequest,
+) (*azdext.KeyValueListResponse, error) {
+	values := s.values[req.Name]
+	keyValues := make([]*azdext.KeyValue, 0, len(values))
+	for key, value := range values {
+		keyValues = append(keyValues, &azdext.KeyValue{Key: key, Value: value})
+	}
+
+	return &azdext.KeyValueListResponse{KeyValues: keyValues}, nil
+}
+
 type testWorkflowServiceServer struct {
 	azdext.UnimplementedWorkflowServiceServer
 	runCalls int
@@ -233,12 +269,16 @@ func newTestAzdClient(
 	t *testing.T,
 	envServer azdext.EnvironmentServiceServer,
 	workflowServer azdext.WorkflowServiceServer,
+	promptServers ...azdext.PromptServiceServer,
 ) *azdext.AzdClient {
 	t.Helper()
 
 	grpcServer := grpc.NewServer()
 	azdext.RegisterEnvironmentServiceServer(grpcServer, envServer)
 	azdext.RegisterWorkflowServiceServer(grpcServer, workflowServer)
+	if len(promptServers) > 0 {
+		azdext.RegisterPromptServiceServer(grpcServer, promptServers[0])
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -547,4 +587,176 @@ func TestSetEnvValue_PersistsKeyValue(t *testing.T) {
 
 	// Verify the value was updated
 	require.Equal(t, "false", envServer.values[envName]["USE_EXISTING_AI_PROJECT"])
+}
+
+func TestMissingInitAzureContextValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		azureContext *azdext.AzureContext
+		want         []string
+	}{
+		{
+			name: "nil context",
+			want: []string{"AZURE_SUBSCRIPTION_ID", "AZURE_LOCATION"},
+		},
+		{
+			name:         "nil scope",
+			azureContext: &azdext.AzureContext{},
+			want:         []string{"AZURE_SUBSCRIPTION_ID", "AZURE_LOCATION"},
+		},
+		{
+			name: "missing both",
+			azureContext: &azdext.AzureContext{
+				Scope: &azdext.AzureScope{},
+			},
+			want: []string{"AZURE_SUBSCRIPTION_ID", "AZURE_LOCATION"},
+		},
+		{
+			name: "missing subscription",
+			azureContext: &azdext.AzureContext{
+				Scope: &azdext.AzureScope{Location: "eastus"},
+			},
+			want: []string{"AZURE_SUBSCRIPTION_ID"},
+		},
+		{
+			name: "missing location",
+			azureContext: &azdext.AzureContext{
+				Scope: &azdext.AzureScope{SubscriptionId: "sub-id"},
+			},
+			want: []string{"AZURE_LOCATION"},
+		},
+		{
+			name: "complete",
+			azureContext: &azdext.AzureContext{
+				Scope: &azdext.AzureScope{SubscriptionId: "sub-id", Location: "eastus"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, missingInitAzureContextValues(tt.azureContext))
+		})
+	}
+}
+
+func TestShouldDeferInitAzureContext(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, shouldDeferInitAzureContext(false, &azdext.AzureContext{}))
+	require.True(t, shouldDeferInitAzureContext(true, &azdext.AzureContext{}))
+	require.False(t, shouldDeferInitAzureContext(true, &azdext.AzureContext{
+		Scope: &azdext.AzureScope{SubscriptionId: "sub-id", Location: "eastus"},
+	}))
+}
+
+func TestConfigureDeferredInitAzureContext_PersistsProjectSignalOnly(t *testing.T) {
+	const envName = "test-env"
+
+	envServer := &testEnvironmentServiceServer{
+		values: map[string]map[string]string{envName: {}},
+	}
+	azdClient := newTestAzdClient(t, envServer, &testWorkflowServiceServer{})
+	azureContext := &azdext.AzureContext{
+		Scope: &azdext.AzureScope{SubscriptionId: "sub-id"},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return configureDeferredInitAzureContext(
+			t.Context(), azdClient, envName, azureContext, true,
+		)
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "false", envServer.values[envName]["USE_EXISTING_AI_PROJECT"])
+	require.Equal(t, pendingReasonProject, envServer.values[envName][pendingProvisionEnvVar])
+	require.Contains(t, output, "Missing Azure environment values: AZURE_LOCATION")
+	require.Contains(t, output, "azd env set AZURE_LOCATION <region>")
+	require.NotContains(t, output, "azd env set AZURE_SUBSCRIPTION_ID")
+	require.Contains(t, output, "Model resource configuration was deferred")
+	require.Contains(t, output, "deployments:")
+	require.Contains(t, output, "format: OpenAI")
+}
+
+func TestTracingDisclaimer(t *testing.T) {
+	t.Parallel()
+
+	got := tracingDisclaimer()
+
+	// String-contains assertions are safe against any surrounding ANSI color or
+	// OSC-8 hyperlink escape sequences, since the phrases/URL appear contiguously.
+	require.Contains(t, got, "When using Hosted Agents apply appropriate safeguards")
+	require.Contains(t, got, "You are responsible for managing all data that may flow outside")
+	require.Contains(t, got, "your organization's compliance and geographic boundaries")
+	require.Contains(t, got, "Use third-party systems at your own risk")
+	require.Contains(t, got, "When AppInsights is enabled, this project logs traces")
+	require.Contains(t, got, "Certain project members may be able to view user data")
+	require.Contains(t, got, tracingOverviewURL)
+	require.Contains(t, got, disableTracingURL)
+	require.Equal(t, "https://aka.ms/tracing-overview", tracingOverviewURL)
+	require.Equal(t, "https://aka.ms/disable-tracing", disableTracingURL)
+}
+
+// TestConfigureFoundryProjectEnv_BicepLessShortCircuits verifies that for a
+// code-deploy agent (skipACR=true), bicepless=true seeds identity env vars and
+// returns before any Foundry data-plane call. The nil credential turns a
+// regression that re-enables connection discovery into a nil-pointer panic.
+//
+// Note: when skipACR is false (a hosted container agent), bicepless deliberately
+// does NOT short-circuit — it configures ACR so the agent has a registry to push
+// to even on an existing (brownfield) project. That path issues a Foundry
+// connections call and is covered by manual/integration testing rather than here,
+// since it needs a real Foundry projects client.
+func TestConfigureFoundryProjectEnv_BicepLessShortCircuits(t *testing.T) {
+	t.Parallel()
+
+	const envName = "test-env"
+	envServer := &testEnvironmentServiceServer{
+		environments: map[string]*azdext.Environment{envName: {Name: envName}},
+	}
+	azdClient := newTestAzdClient(t, envServer, &testWorkflowServiceServer{})
+
+	project := FoundryProjectInfo{
+		SubscriptionId:    "00000000-0000-0000-0000-000000000000",
+		ResourceGroupName: "rg-test",
+		AccountName:       "acct-test",
+		ProjectName:       "proj-test",
+		Location:          "eastus2",
+	}
+
+	err := configureFoundryProjectEnv(
+		t.Context(), azdClient, nil, envName,
+		project, project.SubscriptionId,
+		true, // skipACR (code deploy)
+		true, // bicepless
+	)
+	require.NoError(t, err)
+
+	written := envServer.values[envName]
+
+	for _, key := range []string{
+		"AZURE_AI_PROJECT_ID",
+		"AZURE_RESOURCE_GROUP",
+		"AZURE_AI_ACCOUNT_NAME",
+		"AZURE_AI_PROJECT_NAME",
+		"FOUNDRY_PROJECT_ENDPOINT",
+		"AZURE_OPENAI_ENDPOINT",
+	} {
+		require.NotEmpty(t, written[key], "expected basic project env var %q to be set", key)
+	}
+
+	for _, key := range []string{
+		"AZURE_CONTAINER_REGISTRY_ENDPOINT",
+		"AZURE_CONTAINER_REGISTRY_RESOURCE_ID",
+		"AZURE_AI_PROJECT_ACR_CONNECTION_NAME",
+		"APPLICATIONINSIGHTS_CONNECTION_STRING",
+		"APPLICATIONINSIGHTS_RESOURCE_ID",
+		"APPLICATIONINSIGHTS_CONNECTION_NAME",
+	} {
+		require.Empty(t, written[key], "must not write %q when bicepless+skipACR", key)
+	}
 }
